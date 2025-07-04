@@ -32,7 +32,6 @@ class DataPreprocessor:
         future_input_sequences_list = []
         target_sequences_list = []
         
-        
         for df in dfs:
 
             # scale the data
@@ -88,83 +87,84 @@ class DataPreprocessor:
         dataset = TensorDataset(historic_input_sequences, future_input_sequences, target_sequences)
 
         return dataset
+    
 
-    def dfs_to_jax(
-        self,
-        dfs: List[pd.DataFrame]
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """
-        Convert a list of pandas DataFrames into JAX arrays for historic inputs,
-        future inputs, and targets.
-        """
-        hist_seqs = []
-        fut_seqs  = []
-        tgt_seqs  = []
+    # def dfs_to_jax(
+    #     self,
+    #     dfs: List[pd.DataFrame]
+    # ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    #     """
+    #     Convert a list of pandas DataFrames into JAX arrays for historic inputs,
+    #     future inputs, and targets.
+    #     """
+    #     hist_seqs = []
+    #     fut_seqs  = []
+    #     tgt_seqs  = []
 
-        for df in dfs:
-            # normalize
-            arr = (df - self.mean_training_set) / self.std_training_set
+    #     for df in dfs:
+    #         # normalize
+    #         arr = (df - self.mean_training_set) / self.std_training_set
 
-            # numpy views
-            hist_arr = arr[self.historic_cols]\
-                .iloc[:-self.forecasting_horizon]\
-                .values
-            fut_arr  = arr[self.future_cols]\
-                .iloc[self.historic_input_sequence_length:]\
-                .values
-            tgt_arr  = arr[[self.target_col]]\
-                .iloc[self.historic_input_sequence_length:]\
-                .values
+    #         # numpy views
+    #         hist_arr = arr[self.historic_cols]\
+    #             .iloc[:-self.forecasting_horizon]\
+    #             .values
+    #         fut_arr  = arr[self.future_cols]\
+    #             .iloc[self.historic_input_sequence_length:]\
+    #             .values
+    #         tgt_arr  = arr[[self.target_col]]\
+    #             .iloc[self.historic_input_sequence_length:]\
+    #             .values
 
-            # rolling windows
-            hist_win = sliding_window_view(
-                hist_arr,
-                window_shape=self.historic_input_sequence_length,
-                axis=0
-            )
-            fut_win = sliding_window_view(
-                fut_arr,
-                window_shape=self.forecasting_horizon,
-                axis=0
-            )
-            tgt_win = sliding_window_view(
-                tgt_arr,
-                window_shape=self.forecasting_horizon,
-                axis=0
-            )
+    #         # rolling windows
+    #         hist_win = sliding_window_view(
+    #             hist_arr,
+    #             window_shape=self.historic_input_sequence_length,
+    #             axis=0
+    #         )
+    #         fut_win = sliding_window_view(
+    #             fut_arr,
+    #             window_shape=self.forecasting_horizon,
+    #             axis=0
+    #         )
+    #         tgt_win = sliding_window_view(
+    #             tgt_arr,
+    #             window_shape=self.forecasting_horizon,
+    #             axis=0
+    #         )
 
-            # to JAX and reorder to (batch, features, time)
-            hist_jax = jnp.transpose(jnp.array(hist_win), (0, 2, 1))
-            fut_jax  = jnp.transpose(jnp.array(fut_win),  (0, 2, 1))
-            tgt_jax  = jnp.transpose(jnp.array(tgt_win),  (0, 2, 1))
+    #         # to JAX and reorder to (batch, features, time)
+    #         hist_jax = jnp.transpose(jnp.array(hist_win), (0, 2, 1))
+    #         fut_jax  = jnp.transpose(jnp.array(fut_win),  (0, 2, 1))
+    #         tgt_jax  = jnp.transpose(jnp.array(tgt_win),  (0, 2, 1))
 
-            # NaN filtering
-            hist_nans = jnp.max(jnp.mean(jnp.isnan(hist_jax), axis=1), axis=1)
-            fut_nans  = jnp.max(jnp.mean(jnp.isnan(fut_jax),  axis=1), axis=1)
-            mask = jnp.maximum(hist_nans, fut_nans) <= self.max_nan_pct
+    #         # NaN filtering
+    #         hist_nans = jnp.max(jnp.mean(jnp.isnan(hist_jax), axis=1), axis=1)
+    #         fut_nans  = jnp.max(jnp.mean(jnp.isnan(fut_jax),  axis=1), axis=1)
+    #         mask = jnp.maximum(hist_nans, fut_nans) <= self.max_nan_pct
 
-            hist_jax = hist_jax[mask]
-            fut_jax  = fut_jax[mask]
-            tgt_jax  = tgt_jax[mask]
+    #         hist_jax = hist_jax[mask]
+    #         fut_jax  = fut_jax[mask]
+    #         tgt_jax  = tgt_jax[mask]
 
-            # optional missing-value scaling
-            if self.scale_inputs_with_missing_values:
-                hist_frac = jnp.mean(jnp.isnan(hist_jax), axis=2, keepdims=True)
-                fut_frac  = jnp.mean(jnp.isnan(fut_jax),  axis=2, keepdims=True)
-                hist_jax = hist_jax / hist_frac
-                fut_jax  = fut_jax  / fut_frac
+    #         # optional missing-value scaling
+    #         if self.scale_inputs_with_missing_values:
+    #             hist_frac = jnp.mean(jnp.isnan(hist_jax), axis=2, keepdims=True)
+    #             fut_frac  = jnp.mean(jnp.isnan(fut_jax),  axis=2, keepdims=True)
+    #             hist_jax = hist_jax / hist_frac
+    #             fut_jax  = fut_jax  / fut_frac
 
-            # fill NaNs
-            hist_jax = jnp.nan_to_num(hist_jax, nan=0.0)
-            fut_jax  = jnp.nan_to_num(fut_jax,  nan=0.0)
+    #         # fill NaNs
+    #         hist_jax = jnp.nan_to_num(hist_jax, nan=0.0)
+    #         fut_jax  = jnp.nan_to_num(fut_jax,  nan=0.0)
 
-            hist_seqs.append(hist_jax)
-            fut_seqs.append(fut_jax)
-            tgt_seqs.append(tgt_jax)
+    #         hist_seqs.append(hist_jax)
+    #         fut_seqs.append(fut_jax)
+    #         tgt_seqs.append(tgt_jax)
 
-        # concatenate and move to device
-        historic_input_sequences = device_put(jnp.concatenate(hist_seqs, axis=0))
-        future_input_sequences   = device_put(jnp.concatenate(fut_seqs,  axis=0))
-        target_sequences         = device_put(jnp.concatenate(tgt_seqs,  axis=0))
+    #     # concatenate and move to device
+    #     historic_input_sequences = device_put(jnp.concatenate(hist_seqs, axis=0))
+    #     future_input_sequences   = device_put(jnp.concatenate(fut_seqs,  axis=0))
+    #     target_sequences         = device_put(jnp.concatenate(tgt_seqs,  axis=0))
 
-        return historic_input_sequences, future_input_sequences, target_sequences
+    #     return historic_input_sequences, future_input_sequences, target_sequences
