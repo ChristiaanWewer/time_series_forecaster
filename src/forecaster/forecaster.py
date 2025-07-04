@@ -9,13 +9,14 @@ import pandas as pd
 
 import operator
 
-import jax.numpy as jnp
-from jax import device_put
+# import jax.numpy as jnp
+# from jax import device_put
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from typing import List, Tuple
-import optax
-from optax import Adam
+# import optax
+# from optax import Adam
+from src.data.preprocessing import DataPreprocessor
 
 class Forecaster():
     def __init__(
@@ -41,6 +42,7 @@ class Forecaster():
             batch_size=512,
             dtype=torch.float32,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+            optimizer = 'adam',
             max_nan_pct=0,
             scale_inputs_with_missing_values=False,
             seed=42,
@@ -66,7 +68,6 @@ class Forecaster():
         self.model_config['forecasting_horizon'] = forecasting_horizon
         self.model_config['historic_input_sequence_length'] = historic_input_sequence_length
         
-
         self.model_uninitialized = model
 
         # save the NN class to be used for the model and compile it for faster training
@@ -93,9 +94,6 @@ class Forecaster():
         self.aggregation_criterion = save_aggregation_criterion
         self.save_operator = operator.lt if higher_or_lower_is_better == 'lower' else operator.gt
 
-
-
-
         # make the training and validation sets
         # note we have multiple validation and training sets
         self.dfs_training_sets = dfs_training_sets
@@ -107,16 +105,14 @@ class Forecaster():
         self.std_training_set = dfs_training_sets_concat.std()
 
         # 1) best criterion initialization
-        self.best_logged_criterion = device_put(
-            jnp.array(jnp.inf, dtype=self.dtype)
-        ) if higher_or_lower_is_better == 'lower' else device_put(
-            jnp.array(-jnp.inf, dtype=self.dtype)
-        )
-
-        # 2) build JAX datasets
-        training_dataset = self.__dfs_to_jax(dfs_training_sets)
-        validation_datasets = [self.__dfs_to_jax([df]) for df in self.dfs_validation_sets]
-
+        self.best_logged_criterion = np.array(np.inf, dtype=self.dtype) \
+            if higher_or_lower_is_better == 'lower' \
+            else np.array(-np.inf, dtype=self.dtype)
+    
+        # 2) build TORCH datasets
+        training_dataset = DataPreprocessor.__dfs_to_torch(dfs_training_sets)
+        validation_datasets = [DataPreprocessor.__dfs_to_torch([df]) for df in self.dfs_validation_sets]
+        
         # 3) create DataLoader equivalents
         self.training_loader = DataLoader(
             training_dataset,
@@ -130,15 +126,18 @@ class Forecaster():
 
         # 4) compute batch counts
         self.N_validation_sets = len(self.validation_loaders)
-        self.N_batches_per_validation_set = [
-            device_put(jnp.array(len(loader), dtype=self.dtype))
+        self.N_batches_per_validation_set = [len(loader)
             for loader in self.validation_loaders
         ]
         self.N_batches_per_training_set = len(self.training_loader)
 
-        # 5) optimizer setup (using Optax)
-        self.optimizer = optax.adam(self.learning_rate)
-        # assume you have a PyTree of params in `self.model_params`
+        # 5) optimizer setup, call optimizer string ('adam' e.g.) on the torch.optim module
+        # getattr(torch.optim, optimizer) is used to get the optimizer class
+        self.optimizer = getattr(torch.optim, optimizer)(
+            self.model.parameters(),
+            lr=self.learning_rate
+        )
+
         self.opt_state = self.optimizer.init(self.model_params)
 
         # 6) loss & logging criteria
@@ -149,18 +148,18 @@ class Forecaster():
         self.N_criteria = len(self.validation_logging_criteria)
 
         # 7) initialize logs
-        self.loss_criterion_training_set_log_tensor = jnp.zeros(
+        self.loss_criterion_training_set_log_tensor = np.zeros(
             (self.number_of_epochs,), dtype=self.dtype
         )
-        self.results_criteria_on_validation_sets_log_tensor = jnp.zeros(
+        self.results_criteria_on_validation_sets_log_tensor = np.zeros(
             (self.number_of_epochs, self.N_validation_sets, self.N_criteria),
             dtype=self.dtype
         )
         self.logging_criteria_aggregated = {
-            'mean':   jnp.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
-            'max':    jnp.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
-            'min':    jnp.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
-            'median': jnp.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
+            'mean':   np.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
+            'max':    np.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
+            'min':    np.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
+            'median': np.zeros((self.number_of_epochs, self.N_criteria), dtype=self.dtype),
         }
 
           # make placeholder for the train time
@@ -178,149 +177,6 @@ class Forecaster():
                 os.makedirs(self.save_path)
 
             self.save_path_model = os.path.join(self.save_path, f'model_{name}.pt')
-
-    def __dfs_to_torch(self, dfs):
-
-        historic_input_sequences_list = []
-        future_input_sequences_list = []
-        target_sequences_list = []
-        
-        
-        for df in dfs:
-
-            # scale the data
-            df = (df - self.mean_training_set) / self.std_training_set
-
-            # use torch to create a rolling window of the data, with a window size of 'historic_input_sequence_length' days
-            historic_input_sequences = torch.tensor(df[self.historic_cols].iloc[:-self.forecasting_horizon].values).unfold(0, self.historic_input_sequence_length, 1).permute(0, 2, 1)
-            future_input_sequences = torch.tensor(df[self.future_cols].iloc[self.historic_input_sequence_length:].values).unfold(0, self.forecasting_horizon, 1).permute(0, 2, 1)
-            target_sequences = torch.tensor(df[[self.target_col]].iloc[self.historic_input_sequence_length:].values).unfold(0, self.forecasting_horizon, 1).permute(0, 2, 1)
-
-            # remove sequences with NaNs
-            historic_nans = historic_input_sequences.isnan().to(self.dtype).mean(dim=1).max(dim=1).values
-            future_nans = future_input_sequences.isnan().to(self.dtype).mean(dim=1).max(dim=1).values
-
-            # make array that takes the max of the two
-            max_nans_per_input = torch.max(historic_nans, future_nans)
-
-            # select nans to keep
-            nans_to_keep = max_nans_per_input <= self.max_nan_pct
-            historic_input_sequences = historic_input_sequences[nans_to_keep]
-            future_input_sequences = future_input_sequences[nans_to_keep]
-            target_sequences = target_sequences[nans_to_keep]
-
-            # if one row has a nan, make sure it is scaled with the missing value to make sure the next hidden state 
-            # is in the same range
-            # we scale it pct wise, so lets say if we have at row t 4 rows, e.g. the rows shape is [12000, 365, 4],
-            # and we have 2 nans, then we scale the inputs with 4/2
-            if self.scale_inputs_with_missing_values:
-                
-                # compute the number of nans in the data
-                nr_of_nans_in_historic_data = historic_input_sequences.isnan().to(self.dtype).mean(dim=2).unsqueeze(-1)
-                nr_of_nans_in_future_data = future_input_sequences.isnan().to(self.dtype).mean(dim=2).unsqueeze(-1)
-
-                # scale the inputs with the number of nans in the data
-                historic_input_sequences = historic_input_sequences / nr_of_nans_in_historic_data
-                future_input_sequences = future_input_sequences / nr_of_nans_in_future_data
-
-            # fill nans with 0s in the historic input sequences and in the future input sequences
-            historic_input_sequences = torch.nan_to_num(historic_input_sequences, nan=0.0).to(self.dtype)
-            future_input_sequences = torch.nan_to_num(future_input_sequences, nan=0.0).to(self.dtype)
-
-            # add the sequences to the lists
-            historic_input_sequences_list.append(historic_input_sequences)
-            future_input_sequences_list.append(future_input_sequences)
-            target_sequences_list.append(target_sequences)
-        
-        # concatenate the sequences
-        historic_input_sequences = torch.cat(historic_input_sequences_list, dim=0).to(device=self.device, dtype=self.dtype)
-        future_input_sequences = torch.cat(future_input_sequences_list, dim=0).to(device=self.device, dtype=self.dtype)
-        target_sequences = torch.cat(target_sequences_list, dim=0).to(device=self.device, dtype=self.dtype)
-        
-        # turn into TensorDataset
-        dataset = TensorDataset(historic_input_sequences, future_input_sequences, target_sequences)
-
-        return dataset
-
-    def __dfs_to_jax(
-        self,
-        dfs: List[pd.DataFrame]
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """
-        Convert a list of pandas DataFrames into JAX arrays for historic inputs,
-        future inputs, and targets.
-        """
-        hist_seqs = []
-        fut_seqs  = []
-        tgt_seqs  = []
-
-        for df in dfs:
-            # normalize
-            arr = (df - self.mean_training_set) / self.std_training_set
-
-            # numpy views
-            hist_arr = arr[self.historic_cols]\
-                .iloc[:-self.forecasting_horizon]\
-                .values
-            fut_arr  = arr[self.future_cols]\
-                .iloc[self.historic_input_sequence_length:]\
-                .values
-            tgt_arr  = arr[[self.target_col]]\
-                .iloc[self.historic_input_sequence_length:]\
-                .values
-
-            # rolling windows
-            hist_win = sliding_window_view(
-                hist_arr,
-                window_shape=self.historic_input_sequence_length,
-                axis=0
-            )
-            fut_win = sliding_window_view(
-                fut_arr,
-                window_shape=self.forecasting_horizon,
-                axis=0
-            )
-            tgt_win = sliding_window_view(
-                tgt_arr,
-                window_shape=self.forecasting_horizon,
-                axis=0
-            )
-
-            # to JAX and reorder to (batch, features, time)
-            hist_jax = jnp.transpose(jnp.array(hist_win), (0, 2, 1))
-            fut_jax  = jnp.transpose(jnp.array(fut_win),  (0, 2, 1))
-            tgt_jax  = jnp.transpose(jnp.array(tgt_win),  (0, 2, 1))
-
-            # NaN filtering
-            hist_nans = jnp.max(jnp.mean(jnp.isnan(hist_jax), axis=1), axis=1)
-            fut_nans  = jnp.max(jnp.mean(jnp.isnan(fut_jax),  axis=1), axis=1)
-            mask = jnp.maximum(hist_nans, fut_nans) <= self.max_nan_pct
-
-            hist_jax = hist_jax[mask]
-            fut_jax  = fut_jax[mask]
-            tgt_jax  = tgt_jax[mask]
-
-            # optional missing-value scaling
-            if self.scale_inputs_with_missing_values:
-                hist_frac = jnp.mean(jnp.isnan(hist_jax), axis=2, keepdims=True)
-                fut_frac  = jnp.mean(jnp.isnan(fut_jax),  axis=2, keepdims=True)
-                hist_jax = hist_jax / hist_frac
-                fut_jax  = fut_jax  / fut_frac
-
-            # fill NaNs
-            hist_jax = jnp.nan_to_num(hist_jax, nan=0.0)
-            fut_jax  = jnp.nan_to_num(fut_jax,  nan=0.0)
-
-            hist_seqs.append(hist_jax)
-            fut_seqs.append(fut_jax)
-            tgt_seqs.append(tgt_jax)
-
-        # concatenate and move to device
-        historic_input_sequences = device_put(jnp.concatenate(hist_seqs, axis=0))
-        future_input_sequences   = device_put(jnp.concatenate(fut_seqs,  axis=0))
-        target_sequences         = device_put(jnp.concatenate(tgt_seqs,  axis=0))
-
-        return historic_input_sequences, future_input_sequences, target_sequences
 
 
     def compute_nummber_of_parameters(self):
@@ -377,7 +233,7 @@ class Forecaster():
             self.results_criteria_on_validation_sets_log_tensor[epoch, i, :] = logging_tensor
 
         # compute the mean of the results
-        self.logging_criteria_aggregated['mean'][epoch, :] = torch.mean(self.results_criteria_on_validation_sets_log_tensor[epoch, :, :], dim=0)
+        self.logging_criteria_aggregated['mean'][epoch, :] = torch.mean(self.results_criteria_on_validation_sets_log_tensor[epoch, :, :], dim=0).values
         self.logging_criteria_aggregated['max'][epoch, :] = torch.max(self.results_criteria_on_validation_sets_log_tensor[epoch, :, :], dim=0).values
         self.logging_criteria_aggregated['min'][epoch, :] = torch.min(self.results_criteria_on_validation_sets_log_tensor[epoch, :, :], dim=0).values   
         self.logging_criteria_aggregated['median'][epoch, :] = torch.median(self.results_criteria_on_validation_sets_log_tensor[epoch, :, :], dim=0).values
@@ -428,9 +284,11 @@ class Forecaster():
         if batch_size is None:
             batch_size = self.batch_size
 
+        # make data loader with the test data
+        test_dataset = 
+
     pass
             
-
 
     def __train_model(self, epoch):
         """
