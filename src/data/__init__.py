@@ -1,1 +1,1 @@
-from src.data.preprocessing import DataPreprocessor
+from src.data.preprocessing import TimeSeriesDataPreprocessor

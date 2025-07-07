@@ -44,7 +44,6 @@ class Forecaster():
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             optimizer = 'adam',
             max_nan_pct=0,
-            scale_inputs_with_missing_values=False,
             seed=42,
             ):
         """
@@ -285,8 +284,7 @@ class Forecaster():
             batch_size = self.batch_size
 
         # make data loader with the test data
-        test_dataset = 
-
+    
     pass
             
 
