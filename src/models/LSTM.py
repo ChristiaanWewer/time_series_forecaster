@@ -80,7 +80,7 @@ class LSTMHistoric(nn.Module):
         x_encoded_h, _ = self.historic_lstm(X['x_h'])
         x_encoded_h = x_encoded_h[:, -1, :]
         x_encoded_h = self.dropout_layer(x_encoded_h)
-        x_decoded = self.output_layer(x_encoded_h).unsqueeze(-1) # [batch_size, seq_len] -> [batch_size, seq_len, 1]
+        x_decoded = self.output_layer(x_encoded_h).unsqueeze(-1)  # (B, hidden) -> (B, horizon, 1)
         # print('x_decoded.shape')
         # print(x_decoded.shape)
 
