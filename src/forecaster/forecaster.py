@@ -5,9 +5,11 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
-from src.data.preprocessing import TimeSeriesDataPreprocessor
+from src.data.datasource import DataSource
+from src.data.normalization import compute_norm_stats
+from src.data.timeseries_dataset import TimeSeriesDataset, _collate_fn
 from src.utils.scores_and_losses import MAE, DILATE, assert_differentiable, resolve_metric
 
 
@@ -17,13 +19,12 @@ class Forecaster:
             model,
             model_config,
             name,
-            dfs_training_sets,
-            dfs_validation_sets,
+            training_datasets: list[DataSource],
+            validation_datasets: list[DataSource],
             historic_cols=[],
             future_cols=[],
             forecasting_horizon=7,
             historic_input_sequence_length=365,
-            target_col='target',
             save_path='/',
             loss_function='mae',
             validation_score='mae',
@@ -33,6 +34,12 @@ class Forecaster:
             number_of_epochs=100,
             learning_rate=0.001,
             batch_size=512,
+            patch_size=64,
+            num_workers=0,
+            prefetch_factor=2,
+            pin_memory=False,
+            drop_last=False,
+            shuffle=True,
             dtype=torch.float32,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             optimizer='adam',
@@ -53,7 +60,6 @@ class Forecaster:
         self.future_cols = future_cols
         self.forecasting_horizon = forecasting_horizon
         self.historic_input_sequence_length = historic_input_sequence_length
-        self.target_col = target_col
         self.save_path = save_path
 
         # resolve string metric names
@@ -84,46 +90,51 @@ class Forecaster:
         self.model_config['historic_input_sequence_length'] = historic_input_sequence_length
         self.model = model(self.model_config)
         self.model.to(device=self.device, dtype=self.dtype)
-        # self.model stays raw (deepcopy/save); _model_forward is used for all forward passes
         self._model_forward = torch.compile(self.model, dynamic=True) if use_torch_compile else self.model
 
-        # datasets (raw, un-normalized)
-        preprocessor = TimeSeriesDataPreprocessor(
-            historic_input_sequence_length=historic_input_sequence_length,
-            forecasting_horizon=forecasting_horizon,
+        # normalization stats over all datasets (train + val combined)
+        all_sources = training_datasets + validation_datasets
+        norm_stats = compute_norm_stats(
+            sources=all_sources,
+            seq_len=historic_input_sequence_length,
+            horizon=forecasting_horizon,
             historic_cols=historic_cols,
             future_cols=future_cols,
-            target_col=target_col,
+            patch_size=patch_size,
+        )
+        self.target_mean = norm_stats.get('target_mean', 0.0)
+        self.target_std = norm_stats.get('target_std', 1.0)
+
+        # datasets
+        _ds_kwargs = dict(
+            seq_len=historic_input_sequence_length,
+            horizon=forecasting_horizon,
+            historic_cols=historic_cols,
+            future_cols=future_cols,
+            patch_size=patch_size,
+            norm_stats=norm_stats,
             dtype=dtype,
         )
-        training_dataset_raw = preprocessor.input_dfs_to_tensordataset(dfs_training_sets)
-        validation_datasets_raw = [preprocessor.input_dfs_to_tensordataset([df]) for df in dfs_validation_sets]
+        training_dataset = TimeSeriesDataset(sources=training_datasets, **_ds_kwargs)
+        val_datasets = [TimeSeriesDataset(sources=[src], **_ds_kwargs) for src in validation_datasets]
 
-        # per-column normalization over ALL datasets (train + val) so stats cover the full range
-        _all_xh = torch.cat([training_dataset_raw.tensors[0]] + [ds.tensors[0] for ds in validation_datasets_raw])
-        _all_xf = torch.cat([training_dataset_raw.tensors[1]] + [ds.tensors[1] for ds in validation_datasets_raw])
-        _all_y  = torch.cat([training_dataset_raw.tensors[2]] + [ds.tensors[2] for ds in validation_datasets_raw])
-        _xh_mean = _all_xh.mean(dim=(0, 1))
-        _xh_std  = _all_xh.std(dim=(0, 1)).clamp(min=1e-8)
-        _xf_mean = _all_xf.mean(dim=(0, 1))
-        _xf_std  = _all_xf.std(dim=(0, 1)).clamp(min=1e-8)
-        _y_valid = _all_y[~_all_y.isnan()]
-        self.target_mean = float(_y_valid.mean())
-        self.target_std  = float(_y_valid.std().clamp(min=1e-8))
+        # DataLoader settings
+        _loader_kwargs = dict(
+            collate_fn=_collate_fn,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
+        if num_workers > 0:
+            _loader_kwargs['num_workers'] = num_workers
+            _loader_kwargs['prefetch_factor'] = prefetch_factor
 
-        def _normalize(ds):
-            xh, xf, y = ds.tensors
-            return TensorDataset(
-                (xh - _xh_mean) / _xh_std,
-                (xf - _xf_mean) / _xf_std,
-                (y - self.target_mean) / self.target_std,
-            )
-
-        training_dataset = _normalize(training_dataset_raw)
-        validation_datasets = [_normalize(ds) for ds in validation_datasets_raw]
-
-        self.training_loader = DataLoader(training_dataset, batch_size=self.batch_size, shuffle=True)
-        self.validation_loaders = [DataLoader(ds, batch_size=self.batch_size, shuffle=False) for ds in validation_datasets]
+        self.training_loader = DataLoader(
+            training_dataset, batch_size=batch_size, shuffle=shuffle, **_loader_kwargs
+        )
+        self.validation_loaders = [
+            DataLoader(ds, batch_size=batch_size, shuffle=False, **_loader_kwargs)
+            for ds in val_datasets
+        ]
 
         self.N_validation_sets = len(self.validation_loaders)
         self.N_batches_per_validation_set = [len(l) for l in self.validation_loaders]
@@ -166,11 +177,9 @@ class Forecaster:
         if path is None:
             path = self.save_path_best
         state_dict = torch.load(path, map_location=self.device, weights_only=True)
-        # checkpoints from a compiled model have keys prefixed with '_orig_mod.' — strip them
         if any(k.startswith('_orig_mod.') for k in state_dict):
             state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
         self.model.load_state_dict(state_dict)
-        # re-wrap compiled forward if this forecaster uses torch.compile
         if self._model_forward is not self.model:
             self._model_forward = torch.compile(self.model, dynamic=True)
 
@@ -200,11 +209,12 @@ class Forecaster:
         self.model.train()
         loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         n = 0
-        for x_h, x_f, y in self.training_loader:
+        for batch in self.training_loader:
+            y = batch['y']
             valid = ~y.isnan().any(dim=(1, 2))
             if not valid.any():
                 continue
-            X = {'x_h': x_h[valid], 'x_f': x_f[valid]}
+            X = {k: v[valid] for k, v in batch.items() if k != 'y'}
             loss += self.__training_step(X, y[valid])
             n += 1
         self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
@@ -214,11 +224,12 @@ class Forecaster:
         for i, loader in enumerate(self.validation_loaders):
             log = torch.zeros(self.N_criteria, device=self.device, dtype=self.dtype)
             n = 0
-            for x_h, x_f, y in loader:
+            for batch in loader:
+                y = batch['y']
                 valid = ~y.isnan().any(dim=(1, 2))
                 if not valid.any():
                     continue
-                X = {'x_h': x_h[valid], 'x_f': x_f[valid]}
+                X = {k: v[valid] for k, v in batch.items() if k != 'y'}
                 log += self.__evaluation_step(X, y[valid], self.validation_logging_criteria)
                 n += 1
             self.val_log[epoch, i, :] = (log / n).detach().cpu().numpy() if n else np.nan
@@ -259,13 +270,21 @@ class Forecaster:
 
     def predict(self, x_test, batch_size=None, denormalize=True):
         batch_size = batch_size or self.batch_size
-        loader = DataLoader(x_test, batch_size=batch_size, shuffle=False)
+        is_new = isinstance(x_test, TimeSeriesDataset)
+        loader = DataLoader(
+            x_test,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=_collate_fn if is_new else None,
+        )
         self.model.eval()
         preds = []
         with torch.no_grad():
             for batch in loader:
-                x_h, x_f = batch[0], batch[1]
-                X = {'x_h': x_h, 'x_f': x_f}
+                if isinstance(batch, dict):
+                    X = {k: v for k, v in batch.items() if k != 'y'}
+                else:
+                    X = {'x_h': batch[0], 'x_f': batch[1]}
                 preds.append(self._model_forward(X))
         preds = torch.cat(preds, dim=0)
         if denormalize:
