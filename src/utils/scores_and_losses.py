@@ -1,3 +1,4 @@
+import ast
 import torch
 import torch.nn as nn
 
@@ -6,13 +7,23 @@ REGISTRY: dict = {}  # populated after class definitions
 
 
 def resolve_metric(metric):
-    """Accept a metric instance or a name string (e.g. 'mae', 'dilate') and return an instance."""
-    if isinstance(metric, str):
-        key = metric.lower()
-        if key not in REGISTRY:
-            raise ValueError(f"Unknown metric '{metric}'. Available: {list(REGISTRY)}")
-        return REGISTRY[key]()
-    return metric
+    """Accept a metric instance or a name string and return an instance.
+
+    Supported string forms:
+        'mae'                           — no-arg instantiation
+        'DILATE(alpha=0.5, gamma=0.01)' — kwargs parsed safely via ast
+    """
+    if not isinstance(metric, str):
+        return metric
+    if '(' in metric:
+        call = ast.parse(metric.strip(), mode='eval').body
+        name = call.func.id.lower()
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+    else:
+        name, kwargs = metric.strip().lower(), {}
+    if name not in REGISTRY:
+        raise ValueError(f"Unknown metric '{metric}'. Available: {list(REGISTRY)}")
+    return REGISTRY[name](**kwargs)
 
 
 def assert_differentiable(metric):
@@ -86,8 +97,9 @@ class DILATE(_Metric):
         use_torch_compile: Wrap the loss function with torch.compile (PyTorch 2.0+).
     """
     differentiable = True
+    eval_on_normalized = True  # soft-DTW overflows on large denormalized values
 
-    def __init__(self, alpha=0.5, gamma=0.01, use_torch_compile=False):
+    def __init__(self, alpha=0.5, gamma=0.01, use_torch_compile=True):
         super().__init__(dim=None)
         self.alpha = alpha
         self.gamma = gamma

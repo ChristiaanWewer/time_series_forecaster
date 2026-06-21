@@ -29,7 +29,7 @@ class Forecaster:
             validation_score='mae',
             minimize_validation_score=True,
             save_aggregation_criterion='mean',
-            validation_logging_criteria=[],
+            validation_logging_criteria=['mae'],
             number_of_epochs=100,
             learning_rate=0.001,
             batch_size=512,
@@ -179,17 +179,18 @@ class Forecaster:
     @torch.no_grad()
     def __evaluation_step(self, X, y, metrics):
         y_pred = self._model_forward(X)
-        valid = ~y.isnan().any(dim=(1, 2))
-        y_pred, y = y_pred[valid], y[valid]
         loss_val = metrics[0](y_pred, y)
         y_pred_d = y_pred * self.target_std + self.target_mean
         y_d      = y      * self.target_std + self.target_mean
-        return torch.stack([loss_val] + [m(y_pred_d, y_d) for m in metrics[1:]])
+        extra = [
+            m(y_pred, y) if getattr(m, 'eval_on_normalized', False) else m(y_pred_d, y_d)
+            for m in metrics[1:]
+        ]
+        return torch.stack([loss_val] + extra)
 
     def __training_step(self, X, y):
         y_pred = self._model_forward(X)
-        valid = ~y.isnan().any(dim=(1, 2))
-        loss = self.loss_function(y_pred[valid], y[valid])
+        loss = self.loss_function(y_pred, y)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -198,19 +199,29 @@ class Forecaster:
     def __train_model(self, epoch):
         self.model.train()
         loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+        n = 0
         for x_h, x_f, y in self.training_loader:
-            X = {'x_h': x_h, 'x_f': x_f}
-            loss += self.__training_step(X, y)
-        self.loss_log[epoch] = (loss / self.N_batches_per_training_set).cpu().item()
+            valid = ~y.isnan().any(dim=(1, 2))
+            if not valid.any():
+                continue
+            X = {'x_h': x_h[valid], 'x_f': x_f[valid]}
+            loss += self.__training_step(X, y[valid])
+            n += 1
+        self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
 
     def __evaluate_model(self, epoch):
         self.model.eval()
         for i, loader in enumerate(self.validation_loaders):
             log = torch.zeros(self.N_criteria, device=self.device, dtype=self.dtype)
+            n = 0
             for x_h, x_f, y in loader:
-                X = {'x_h': x_h, 'x_f': x_f}
-                log += self.__evaluation_step(X, y, self.validation_logging_criteria)
-            self.val_log[epoch, i, :] = (log / self.N_batches_per_validation_set[i]).detach().cpu().numpy()
+                valid = ~y.isnan().any(dim=(1, 2))
+                if not valid.any():
+                    continue
+                X = {'x_h': x_h[valid], 'x_f': x_f[valid]}
+                log += self.__evaluation_step(X, y[valid], self.validation_logging_criteria)
+                n += 1
+            self.val_log[epoch, i, :] = (log / n).detach().cpu().numpy() if n else np.nan
 
         self.val_log_aggregated['mean'][epoch] = np.mean(self.val_log[epoch], axis=0)
         self.val_log_aggregated['max'][epoch] = np.max(self.val_log[epoch], axis=0)
