@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from src.data.datasource import DataSource
 from src.data.normalization import compute_norm_stats
 from src.data.timeseries_dataset import TimeSeriesDataset
+from src.utils.regularization import resolve_regularization
 from src.utils.scores_and_losses import assert_differentiable, metric_to_spec, parse_spec, resolve_metric
 
 
@@ -80,7 +81,7 @@ class Forecaster:
             dtype=torch.float32,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             optimizer='adam',
-            l1_lambda=0.0,
+            regularization=None,
             seed=42,
             use_torch_compile=False,
             save_weights_every_n_epochs=1,
@@ -99,7 +100,6 @@ class Forecaster:
         self.dtype = dtype
         self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.l1_lambda = l1_lambda
         self.number_of_epochs = number_of_epochs
         self.aggregation_criterion = save_aggregation_criterion
         self.minimize_validation_score = minimize_validation_score
@@ -191,17 +191,22 @@ class Forecaster:
 
         # optimizer — weight tensors (dim > 1) vs. bias/1-D params (dim <= 1) split into
         # separate param groups so weight_decay (set via the optimizer spec string, e.g.
-        # 'adamw(weight_decay=0.01)') applies only to weights, never biases; L1 reuses the
-        # same weight-only set (self._l1_params) for the same reason.
+        # 'adamw(weight_decay=0.01)') applies only to weights, never biases; self.regularizer
+        # reuses the same weight-only set (self._regularized_weights) for the same reason.
         weights = [p for p in self.model.parameters() if p.dim() > 1]
         biases = [p for p in self.model.parameters() if p.dim() <= 1]
-        self._l1_params = weights
+        self._regularized_weights = weights
         param_groups = [
             {'params': weights},
             {'params': biases, 'weight_decay': 0.0},
         ]
         self.optimizer_spec = optimizer
         self.optimizer = _resolve_optimizer(optimizer, param_groups, self.learning_rate)
+
+        self.regularization_spec = regularization
+        self.regularizer = resolve_regularization(regularization)
+        if self.regularizer is not None:
+            self.regularizer.bind(self._regularized_weights, self.learning_rate)
 
         # loss & logging criteria
         self.loss_function = loss_function
@@ -260,7 +265,8 @@ class Forecaster:
             'validation_score_spec': self.validation_score_spec,
             'validation_logging_criteria_specs': self.validation_logging_criteria_specs,
             'optimizer_spec': self.optimizer_spec,
-            'l1_lambda': self.l1_lambda,
+            'regularization_spec': self.regularization_spec,
+            'regularizer_state': self.regularizer.get_state() if self.regularizer else None,
             'minimize_validation_score': self.minimize_validation_score,
             'save_aggregation_criterion': self.aggregation_criterion,
             'criteria_names': self._criteria_names,
@@ -356,7 +362,7 @@ class Forecaster:
                 save_aggregation_criterion=ckpt['save_aggregation_criterion'],
                 norm_stats=ckpt['norm_stats'],
                 optimizer=ckpt['optimizer_spec'],
-                l1_lambda=ckpt['l1_lambda'],
+                regularization=ckpt['regularization_spec'],
                 device=device,
                 batch_size=batch_size,
                 num_workers=num_workers,
@@ -366,6 +372,8 @@ class Forecaster:
             )
             fc.model.load_state_dict(ckpt['state_dict'])
             fc.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if fc.regularizer is not None:
+                fc.regularizer.load_state(ckpt['regularizer_state'])
             if learning_rate is not None:
                 for group in fc.optimizer.param_groups:
                     group['lr'] = learning_rate
@@ -405,10 +413,10 @@ class Forecaster:
     def __training_step(self, X, y):
         y_pred = self._model_forward(X)
         loss = self.loss_function(y_pred, y)
-        if self.l1_lambda:
-            loss = loss + self.l1_lambda * sum(p.abs().sum() for p in self._l1_params)
         self.optimizer.zero_grad()
         loss.backward()
+        if self.regularizer is not None:
+            self.regularizer.step(self._regularized_weights)
         self.optimizer.step()
         return loss.detach()
 
