@@ -9,8 +9,13 @@ from torch.utils.data import DataLoader
 
 from src.data.datasource import DataSource
 from src.data.normalization import compute_norm_stats
-from src.data.timeseries_dataset import TimeSeriesDataset, _collate_fn
-from src.utils.scores_and_losses import DILATE, assert_differentiable, metric_to_spec, resolve_metric
+from src.data.timeseries_dataset import TimeSeriesDataset
+from src.utils.scores_and_losses import assert_differentiable, metric_to_spec, resolve_metric
+
+
+def _collate_fn(batch: list[dict]) -> dict:
+    common_keys = set.intersection(*[set(item.keys()) for item in batch])
+    return {k: torch.stack([item[k] for item in batch]) for k in sorted(common_keys)}
 
 
 def _criteria_field_names(criteria: list) -> list[str]:
@@ -92,19 +97,11 @@ class Forecaster:
         validation_logging_criteria = [resolve_metric(m) for m in validation_logging_criteria]
         assert_differentiable(loss_function)
 
-        # reconstructable specs for checkpointing — not the live objects, since a compiled
-        # DILATE holds a torch.compile closure that isn't reliably picklable across processes
+        # reconstructable specs for checkpointing — not the live objects, so metric
+        # configuration survives across processes/machines without pickling nn.Modules
         self.loss_function_spec = metric_to_spec(loss_function)
         self.validation_score_spec = metric_to_spec(self.validation_score)
         self.validation_logging_criteria_specs = [metric_to_spec(m) for m in validation_logging_criteria]
-
-        # compile DILATE kernel once and share across all DILATE instances
-        if use_torch_compile:
-            from src.utils.DILATE.dilate_loss import dilate_loss as _fn
-            _compiled_dilate = torch.compile(_fn, dynamic=True)
-            for _m in [loss_function, self.validation_score] + validation_logging_criteria:
-                if isinstance(_m, DILATE):
-                    _m._dilate_fn = _compiled_dilate
 
         self.save_operator = operator.lt if minimize_validation_score else operator.gt
         self.best_logged_criterion = (
@@ -302,6 +299,12 @@ class Forecaster:
             fc.forecasting_horizon = ckpt['forecasting_horizon']
             fc.historic_input_sequence_length = ckpt['historic_input_sequence_length']
             fc.batch_size = batch_size
+            # training history, so a loaded-for-inference Forecaster still supports the
+            # same post-hoc plotting (loss/val_score curves) a freshly-trained one does
+            fc.loss_log = ckpt['loss_log']
+            fc.val_log = ckpt['val_log']
+            fc.val_log_aggregated = ckpt['val_log_aggregated']
+            fc._criteria_names = ckpt['criteria_names']
             return fc
 
         if resume:
@@ -366,18 +369,6 @@ class Forecaster:
 
     # ── training / evaluation ────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def __evaluation_step(self, X, y, metrics):
-        y_pred = self._model_forward(X)
-        loss_val = metrics[0](y_pred, y)
-        y_pred_d = y_pred * self.target_std + self.target_mean
-        y_d      = y      * self.target_std + self.target_mean
-        extra = [
-            m(y_pred, y) if getattr(m, 'eval_on_normalized', False) else m(y_pred_d, y_d)
-            for m in metrics[1:]
-        ]
-        return torch.stack([loss_val] + extra)
-
     def __training_step(self, X, y):
         y_pred = self._model_forward(X)
         loss = self.loss_function(y_pred, y)
@@ -400,10 +391,14 @@ class Forecaster:
             n += 1
         self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
 
+    @torch.no_grad()
     def __evaluate_model(self, epoch):
         self.model.eval()
+        metrics = self.validation_logging_criteria
+        poolable = [getattr(m, 'poolable', False) for m in metrics]
         for i, loader in enumerate(self.validation_loaders):
             log = torch.zeros(self.N_criteria, device=self.device, dtype=self.dtype)
+            accs = [m.new_accumulators() if p else None for m, p in zip(metrics, poolable)]
             n = 0
             for batch in loader:
                 y = batch['y'].to(self.device)
@@ -411,9 +406,25 @@ class Forecaster:
                 if not valid.any():
                     continue
                 X = {k: v.to(self.device)[valid] for k, v in batch.items() if k != 'y'}
-                log += self.__evaluation_step(X, y[valid], self.validation_logging_criteria)
+                y_valid = y[valid]
+                y_pred = self._model_forward(X)
+                y_pred_d = y_pred * self.target_std + self.target_mean
+                y_d      = y_valid * self.target_std + self.target_mean
+                for idx, m in enumerate(metrics):
+                    # index 0 (the loss function) always sees normalized values, matching
+                    # __training_step; the rest see denormalized unless eval_on_normalized
+                    use_normalized = idx == 0 or getattr(m, 'eval_on_normalized', False)
+                    yp, yt = (y_pred, y_valid) if use_normalized else (y_pred_d, y_d)
+                    if poolable[idx]:
+                        m.accumulate(accs[idx], yp, yt)
+                    else:
+                        log[idx] += m(yp, yt)
                 n += 1
-            row = (log / n).detach().cpu().tolist() if n else [np.nan] * self.N_criteria
+            row = (
+                [m.pooled_value(accs[idx]) if poolable[idx] else (log[idx] / n).item()
+                 for idx, m in enumerate(metrics)]
+                if n else [np.nan] * self.N_criteria
+            )
             self.val_log[epoch, i] = tuple(row)
 
         unstructured = rfn.structured_to_unstructured(self.val_log[epoch])
@@ -482,4 +493,4 @@ class Forecaster:
         preds = torch.cat(preds, dim=0)
         if denormalize:
             preds = preds * self.target_std + self.target_mean
-        return preds
+        return preds.detach().cpu().numpy()

@@ -6,11 +6,6 @@ from src.data.datasource import DataSource
 from src.data.normalization import _read_1d_df
 
 
-def _collate_fn(batch: list[dict]) -> dict:
-    common_keys = set.intersection(*[set(item.keys()) for item in batch])
-    return {k: torch.stack([item[k] for item in batch]) for k in sorted(common_keys)}
-
-
 class TimeSeriesDataset(Dataset):
     def __init__(
         self,

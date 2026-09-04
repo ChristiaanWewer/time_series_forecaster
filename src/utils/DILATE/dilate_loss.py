@@ -3,10 +3,6 @@ from .soft_dtw import SoftDTWBatch
 from .path_soft_dtw import PathDTWBatch
 
 
-@torch.compiler.disable  # Dynamo can't trace the .cpu().numpy()/Numba calls inside
-                          # SoftDTWBatch/PathDTWBatch — mark this as an opaque eager
-                          # boundary so torch.compile(dilate_loss) falls back cleanly
-                          # instead of erroring while trying to trace into it.
 def dilate_loss(outputs, targets, alpha, gamma, device):
     # outputs, targets: shape (batch_size, N_output, 1)
     batch_size, N_output = outputs.shape[0:2]
