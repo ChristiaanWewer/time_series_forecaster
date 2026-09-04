@@ -2,14 +2,16 @@ import numpy as np
 import pandas as pd
 
 from src.data.datasource import DataSource
-from src.data.zarr_store import ZarrStoreManager
 
 
 def _read_1d_df(source: DataSource) -> pd.DataFrame | None:
     dfs = []
     if source.csv:
         df = pd.read_csv(source.csv, index_col=source.csv_index_col, parse_dates=True)
-        df = df[(df.index >= source.start) & (df.index <= source.end)]
+        if source.start is not None:
+            df = df[df.index >= source.start]
+        if source.end is not None:
+            df = df[df.index <= source.end]
         dfs.append(df)
     if source.netcdf_1d:
         import xarray as xr
@@ -21,105 +23,108 @@ def _read_1d_df(source: DataSource) -> pd.DataFrame | None:
     if not dfs:
         return None
     if len(dfs) == 1:
-        return dfs[0]
-    return dfs[0].join(dfs[1], how='inner', lsuffix='', rsuffix='_nc')
+        df = dfs[0]
+    else:
+        df = dfs[0].join(dfs[1], how='inner', lsuffix='', rsuffix='_nc')
+    if source.nodata_values:
+        df = df.replace(source.nodata_values, np.nan)
+    return df
+
+
+def _merge_stats(
+    n_a: float, mean_a: float, M2_a: float,
+    n_b: float, mean_b: float, M2_b: float,
+) -> tuple[float, float, float]:
+    """Chan's parallel algorithm: merge two (n, mean, M2) accumulators."""
+    n = n_a + n_b
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    delta = mean_b - mean_a
+    mean = mean_a + delta * (n_b / n)
+    M2 = M2_a + M2_b + delta ** 2 * (n_a * n_b / n)
+    return n, mean, M2
+
+
+def _is_binary(values: np.ndarray) -> bool:
+    return len(values) > 0 and bool(np.all((values == 0) | (values == 1)))
 
 
 def compute_norm_stats(
     sources: list[DataSource],
-    seq_len: int,
-    horizon: int,
     historic_cols: list[str],
     future_cols: list[str],
-    patch_size: int,
+    target_col: str | None = 'y',
 ) -> dict:
     stats = {}
+    all_cols = list(dict.fromkeys(historic_cols + future_cols))
 
-    # --- 1D stats ---
-    hist_accum = {c: [] for c in historic_cols}
-    fut_accum = {c: [] for c in future_cols}
-    y_accum = []
+    accum: dict[str, tuple[float, float, float]] = {c: (0.0, 0.0, 0.0) for c in all_cols}
+    target_accum = (0.0, 0.0, 0.0)
 
+    binary_cols: set[str] = set()
+    for source in sources:
+        binary_cols.update(source.binary_cols)
+
+    has_1d = False
     for source in sources:
         df = _read_1d_df(source)
         if df is None:
             continue
-        for c in historic_cols:
-            if c in df.columns:
-                hist_accum[c].append(df[c].values.astype(np.float32))
-        for c in future_cols:
-            if c in df.columns:
-                fut_accum[c].append(df[c].values.astype(np.float32))
-        if source.target_col in df.columns:
-            vals = df[source.target_col].values.astype(np.float32)
-            y_accum.append(vals[~np.isnan(vals)])
+        has_1d = True
 
-    if historic_cols and any(hist_accum[c] for c in historic_cols):
-        stats['xh_mean'] = np.array(
-            [np.nanmean(np.concatenate(hist_accum[c])) if hist_accum[c] else 0.0 for c in historic_cols],
-            dtype=np.float32,
-        )
-        stats['xh_std'] = np.array(
-            [max(float(np.nanstd(np.concatenate(hist_accum[c]))), 1e-8) if hist_accum[c] else 1.0 for c in historic_cols],
-            dtype=np.float32,
-        )
+        for col in all_cols:
+            if col not in df.columns:
+                continue
+            vals = df[col].values.astype(np.float64)
+            vals = vals[~np.isnan(vals)]
+            if len(vals) == 0:
+                continue
+            if col in binary_cols or _is_binary(vals):
+                binary_cols.add(col)
+                continue
+            n_b = float(len(vals))
+            mean_b = float(vals.mean())
+            M2_b = float(((vals - mean_b) ** 2).sum())
+            accum[col] = _merge_stats(*accum[col], n_b, mean_b, M2_b)
 
-    if future_cols and any(fut_accum[c] for c in future_cols):
-        stats['xf_mean'] = np.array(
-            [np.nanmean(np.concatenate(fut_accum[c])) if fut_accum[c] else 0.0 for c in future_cols],
-            dtype=np.float32,
-        )
-        stats['xf_std'] = np.array(
-            [max(float(np.nanstd(np.concatenate(fut_accum[c]))), 1e-8) if fut_accum[c] else 1.0 for c in future_cols],
-            dtype=np.float32,
-        )
+        if target_col is not None and target_col in df.columns:
+            target_vals = df[target_col].values.astype(np.float64)
+            target_vals = target_vals[~np.isnan(target_vals)]
+            if len(target_vals) > 0:
+                n_b = float(len(target_vals))
+                mean_b = float(target_vals.mean())
+                M2_b = float(((target_vals - mean_b) ** 2).sum())
+                target_accum = _merge_stats(*target_accum, n_b, mean_b, M2_b)
 
-    if y_accum:
-        all_y = np.concatenate(y_accum)
-        stats['target_mean'] = float(np.nanmean(all_y))
-        stats['target_std'] = max(float(np.nanstd(all_y)), 1e-8)
+    if has_1d:
+        xh_mean, xh_std = [], []
+        xf_mean, xf_std = [], []
+        for col in historic_cols:
+            n, mean, M2 = accum[col]
+            if col in binary_cols or n < 2:
+                xh_mean.append(0.0)
+                xh_std.append(1.0)
+            else:
+                xh_mean.append(mean)
+                xh_std.append(max(float(np.sqrt(M2 / (n - 1))), 1e-8))
+        for col in future_cols:
+            n, mean, M2 = accum[col]
+            if col in binary_cols or n < 2:
+                xf_mean.append(0.0)
+                xf_std.append(1.0)
+            else:
+                xf_mean.append(mean)
+                xf_std.append(max(float(np.sqrt(M2 / (n - 1))), 1e-8))
 
-    # --- 2D (grid) stats ---
-    zarr_sources = [s for s in sources if s.zarr]
-    if zarr_sources:
-        # Determine variable order from first zarr source
-        first_ds = ZarrStoreManager.open(zarr_sources[0].zarr)
-        dynamic_vars = [v for v in first_ds.data_vars if v not in zarr_sources[0].static_zarr_vars]
-        stats['zarr_vars'] = dynamic_vars
+        stats['xh_mean'] = np.array(xh_mean, dtype=np.float32)
+        stats['xh_std'] = np.array(xh_std, dtype=np.float32)
+        stats['xf_mean'] = np.array(xf_mean, dtype=np.float32)
+        stats['xf_std'] = np.array(xf_std, dtype=np.float32)
 
-        grid_accum = {v: [] for v in dynamic_vars}
+        n, mean, M2 = target_accum
+        stats['target_mean'] = float(mean)
+        stats['target_std'] = max(float(np.sqrt(M2 / (n - 1))) if n >= 2 else 1.0, 1e-8)
 
-        for source in zarr_sources:
-            ds = ZarrStoreManager.open(source.zarr)
-            ix, iy = ZarrStoreManager.coord_to_index(
-                ds, source.location, source.coord_dims, source.location_is_index
-            )
-            half = patch_size // 2
-            dim_x, dim_y = source.coord_dims
-
-            time_mask = (
-                (ds.time.values >= np.datetime64(source.start)) &
-                (ds.time.values <= np.datetime64(source.end))
-            )
-            time_indices = np.where(time_mask)[0].tolist()
-
-            spatial_sel = {
-                dim_x: slice(ix - half, ix + half + 1),
-                dim_y: slice(iy - half, iy + half + 1),
-            }
-            src_dynamic = [v for v in ds.data_vars if v not in source.static_zarr_vars]
-            for v in dynamic_vars:
-                if v in src_dynamic:
-                    data = ds[v].isel(time=time_indices, **spatial_sel).values
-                    grid_accum[v].append(data.flatten())
-
-        stats['grid_mean'] = np.array(
-            [np.nanmean(np.concatenate(grid_accum[v])) if grid_accum[v] else 0.0 for v in dynamic_vars],
-            dtype=np.float32,
-        )
-        stats['grid_std'] = np.array(
-            [max(float(np.nanstd(np.concatenate(grid_accum[v]))), 1e-8) if grid_accum[v] else 1.0 for v in dynamic_vars],
-            dtype=np.float32,
-        )
+    stats['binary_cols'] = binary_cols
 
     return stats

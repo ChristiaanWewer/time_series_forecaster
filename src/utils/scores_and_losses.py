@@ -26,6 +26,17 @@ def resolve_metric(metric):
     return REGISTRY[name](**kwargs)
 
 
+def metric_to_spec(metric) -> str:
+    """Inverse of resolve_metric: a metric instance -> a string resolve_metric can parse
+    back into an equivalent instance. Used to make a metric's configuration checkpointable
+    without pickling the live nn.Module — a compiled DILATE holds a torch.compile closure
+    that isn't reliably picklable across processes/machines.
+    """
+    if isinstance(metric, DILATE):
+        return f'DILATE(alpha={metric.alpha}, gamma={metric.gamma})'
+    return type(metric).__name__.lower()
+
+
 def assert_differentiable(metric):
     """Raise TypeError if metric cannot be used as a training loss."""
     if not getattr(metric, 'differentiable', True):
@@ -115,6 +126,42 @@ class DILATE(_Metric):
         return loss
 
 
+class NSE(_Metric):
+    """
+    Nash-Sutcliffe Efficiency. 1.0 = perfect fit, 0.0 = as good as predicting the mean,
+    negative = worse than predicting the mean.
+
+    NSE is higher-is-better, so minimizing it directly would push a model the wrong way —
+    it is blocked from use as a training loss (differentiable=False).
+
+    Note: computed on whatever tensor is passed in, using that tensor's own mean as the
+    reference. Forecaster's evaluation loop calls metrics per batch and averages the
+    results, so validation_score='nse' reports the mean of per-batch NSE values, not the
+    single NSE of the full validation set computed at once.
+    """
+    differentiable = False
+
+    def forward(self, y_pred, y_true):
+        numerator = (y_true - y_pred).pow(2).sum()
+        denominator = (y_true - y_true.mean()).pow(2).sum()
+        return 1 - numerator / denominator.clamp(min=1e-8)
+
+
+class AlphaNSE(_Metric):
+    """
+    Variability ratio: std(pred) / std(obs). The "alpha" term from KGE (Gupta et al. 2009),
+    reported standalone here. 1.0 = model reproduces observed variability exactly;
+    < 1 under-predicts variability (over-smooths); > 1 over-predicts it.
+
+    Same per-batch-averaging caveat as NSE applies. differentiable=False for the same
+    reason: it is not a lower-is-better loss.
+    """
+    differentiable = False
+
+    def forward(self, y_pred, y_true):
+        return y_pred.std() / y_true.std().clamp(min=1e-8)
+
+
 REGISTRY = {
     'mae': MAE,
     'mse': MSE,
@@ -122,4 +169,6 @@ REGISTRY = {
     'mape': MAPE,
     'smape': SMAPE,
     'dilate': DILATE,
+    'nse': NSE,
+    'alpha_nse': AlphaNSE,
 }
