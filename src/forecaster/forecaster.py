@@ -10,12 +10,30 @@ from torch.utils.data import DataLoader
 from src.data.datasource import DataSource
 from src.data.normalization import compute_norm_stats
 from src.data.timeseries_dataset import TimeSeriesDataset
-from src.utils.scores_and_losses import assert_differentiable, metric_to_spec, resolve_metric
+from src.utils.scores_and_losses import assert_differentiable, metric_to_spec, parse_spec, resolve_metric
 
 
 def _collate_fn(batch: list[dict]) -> dict:
     common_keys = set.intersection(*[set(item.keys()) for item in batch])
     return {k: torch.stack([item[k] for item in batch]) for k in sorted(common_keys)}
+
+
+_OPTIMIZER_REGISTRY = {
+    name.lower(): cls for name, cls in vars(torch.optim).items()
+    if isinstance(cls, type) and issubclass(cls, torch.optim.Optimizer) and cls is not torch.optim.Optimizer
+}
+
+
+def _resolve_optimizer(spec: str, params, lr: float) -> torch.optim.Optimizer:
+    """Build an optimizer from a spec string, e.g. 'adam' or 'adamw(weight_decay=0.01)' or
+    'sgd(momentum=0.9, weight_decay=1e-4)' — same grammar as resolve_metric's loss specs
+    (see scores_and_losses.parse_spec). An 'lr' kwarg inside the string overrides `lr`.
+    """
+    name, kwargs = parse_spec(spec)
+    if name not in _OPTIMIZER_REGISTRY:
+        raise ValueError(f"Unknown optimizer '{spec}'. Available: {list(_OPTIMIZER_REGISTRY)}")
+    lr = kwargs.pop('lr', lr)
+    return _OPTIMIZER_REGISTRY[name](params, lr=lr, **kwargs)
 
 
 def _criteria_field_names(criteria: list) -> list[str]:
@@ -62,6 +80,7 @@ class Forecaster:
             dtype=torch.float32,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
             optimizer='adam',
+            l1_lambda=0.0,
             seed=42,
             use_torch_compile=False,
             save_weights_every_n_epochs=1,
@@ -80,6 +99,7 @@ class Forecaster:
         self.dtype = dtype
         self.batch_size = batch_size
         self.learning_rate = learning_rate
+        self.l1_lambda = l1_lambda
         self.number_of_epochs = number_of_epochs
         self.aggregation_criterion = save_aggregation_criterion
         self.minimize_validation_score = minimize_validation_score
@@ -169,10 +189,19 @@ class Forecaster:
         self.N_batches_per_validation_set = [len(l) for l in self.validation_loaders]
         self.N_batches_per_training_set = len(self.training_loader)
 
-        # optimizer
-        self.optimizer = getattr(torch.optim, optimizer.capitalize())(
-            self.model.parameters(), lr=self.learning_rate
-        )
+        # optimizer — weight tensors (dim > 1) vs. bias/1-D params (dim <= 1) split into
+        # separate param groups so weight_decay (set via the optimizer spec string, e.g.
+        # 'adamw(weight_decay=0.01)') applies only to weights, never biases; L1 reuses the
+        # same weight-only set (self._l1_params) for the same reason.
+        weights = [p for p in self.model.parameters() if p.dim() > 1]
+        biases = [p for p in self.model.parameters() if p.dim() <= 1]
+        self._l1_params = weights
+        param_groups = [
+            {'params': weights},
+            {'params': biases, 'weight_decay': 0.0},
+        ]
+        self.optimizer_spec = optimizer
+        self.optimizer = _resolve_optimizer(optimizer, param_groups, self.learning_rate)
 
         # loss & logging criteria
         self.loss_function = loss_function
@@ -230,6 +259,8 @@ class Forecaster:
             'loss_function_spec': self.loss_function_spec,
             'validation_score_spec': self.validation_score_spec,
             'validation_logging_criteria_specs': self.validation_logging_criteria_specs,
+            'optimizer_spec': self.optimizer_spec,
+            'l1_lambda': self.l1_lambda,
             'minimize_validation_score': self.minimize_validation_score,
             'save_aggregation_criterion': self.aggregation_criterion,
             'criteria_names': self._criteria_names,
@@ -324,6 +355,8 @@ class Forecaster:
                 minimize_validation_score=ckpt['minimize_validation_score'],
                 save_aggregation_criterion=ckpt['save_aggregation_criterion'],
                 norm_stats=ckpt['norm_stats'],
+                optimizer=ckpt['optimizer_spec'],
+                l1_lambda=ckpt['l1_lambda'],
                 device=device,
                 batch_size=batch_size,
                 num_workers=num_workers,
@@ -372,6 +405,8 @@ class Forecaster:
     def __training_step(self, X, y):
         y_pred = self._model_forward(X)
         loss = self.loss_function(y_pred, y)
+        if self.l1_lambda:
+            loss = loss + self.l1_lambda * sum(p.abs().sum() for p in self._l1_params)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()

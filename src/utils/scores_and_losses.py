@@ -36,6 +36,17 @@ class ChanAccumulator:
         return self.M2 / self.n if self.n > 1 else float('nan')
 
 
+def parse_spec(spec: str) -> tuple[str, dict]:
+    """Parse 'name' or 'name(kw=val, ...)' into (name.lower(), kwargs), kwargs values via
+    ast.literal_eval. Shared grammar for resolve_metric and Forecaster's optimizer spec.
+    """
+    spec = spec.strip()
+    if '(' in spec:
+        call = ast.parse(spec, mode='eval').body
+        return call.func.id.lower(), {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
+    return spec.lower(), {}
+
+
 def resolve_metric(metric):
     """Accept a metric instance or a name string and return an instance.
 
@@ -45,12 +56,7 @@ def resolve_metric(metric):
     """
     if not isinstance(metric, str):
         return metric
-    if '(' in metric:
-        call = ast.parse(metric.strip(), mode='eval').body
-        name = call.func.id.lower()
-        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
-    else:
-        name, kwargs = metric.strip().lower(), {}
+    name, kwargs = parse_spec(metric)
     if name not in REGISTRY:
         raise ValueError(f"Unknown metric '{metric}'. Available: {list(REGISTRY)}")
     return REGISTRY[name](**kwargs)
