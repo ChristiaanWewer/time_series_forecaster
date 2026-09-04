@@ -5,11 +5,10 @@
 ```
 src/
   data/
-    __init__.py              — exports DataSource, TimeSeriesDataPreprocessor
+    __init__.py              — exports DataSource
     datasource.py            — DataSource dataclass
     timeseries_dataset.py    — TimeSeriesDataset + _collate_fn
     normalization.py         — compute_norm_stats, _read_1d_df helper
-    preprocessing.py         — TimeSeriesDataPreprocessor (legacy in-memory 1D path)
   forecaster/
     forecaster.py            — training loop, normalization, logging, checkpointing
   models/
@@ -90,12 +89,6 @@ All values are normalized using `norm_stats`. `y` NaN values are preserved for l
 
 ---
 
-## `src/data/preprocessing.py` — `TimeSeriesDataPreprocessor` (legacy)
-
-Original in-memory preprocessor for 1D CSV data. Kept for internal reference; new code should use `TimeSeriesDataset`.
-
----
-
 ## `src/forecaster/forecaster.py` — `Forecaster`
 
 Training orchestrator. Takes `DataSource` lists, handles normalization, training, validation, checkpointing, and inference.
@@ -163,15 +156,21 @@ Both models receive a single `config` dict. The Forecaster injects `historic_col
 
 ## `check.ipynb`
 
-Reference notebook demonstrating a full training run using the `DataSource` API:
-1. Create `DataSource` descriptors for train/val/test time windows pointing to `data/data.csv`
-2. Inspect `TimeSeriesDataset` output shapes
-3. Train `LSTMHistoric` (16 hidden, 1 layer) for 5 epochs with MAE loss, RMSE val score, NSE also logged via `validation_logging_criteria=['nse']`. `train_source`/`val_source`/`test_source` all set `nodata_values=[-999]` — the target column has 84 `-999` sentinel rows (all in the 2014 tail of `test_source`), converted to `NaN`.
-4. **Evaluation and plotting on `test_source`, for `LSTMHistoric` only** (needs `matplotlib`, added as a project dependency):
-   - Predictions via `fc.predict(test_source)` directly. True values come from a small separate `TimeSeriesDataset` built with `target_col=TARGET_COL` — its only purpose is reading off `test_ds._index`'s `(source_idx, t)` pairs for window/date alignment, not running the model; `target_col` doesn't affect which windows get built (only `x_h`/`x_f` NaN does), so this covers the exact same windows `predict()`'s internal dataset does. Produces aligned, denormalized `(y_true, y_pred)` arrays of shape `(n_windows, horizon)`. Dates per lead time are derived from the recovered `t` values, not assumed contiguous — `TimeSeriesDataset` may skip NaN windows.
-   - Training diagnostics: train/val loss (normalized), val_score (denormalized), and val NSE vs. epoch — three panels, since loss/val_score are on different scales and NSE is unbounded-above-zero on yet another scale
-   - Hydrograph: observed vs. predicted discharge over time, lead times 1/4/7 days overlaid
-   - Scatter plot: observed vs. predicted (lead=1d) with a 1:1 reference line
-   - Flow duration curve: both series sorted descending vs. exceedance probability, log-y
-   - MAE and NSE vs. lead time (1–7 days) — NSE computed via the actual `NSE` class from `scores_and_losses`, not a re-derived formula, with an explicit NaN-mask applied first since the metric classes don't skip NaN on their own the way `np.nanmean` does
-5. Train `LSTMEncoderDecoder` (16 hidden, 1 layer, downscale 8) same settings — no evaluation/plotting cells (LSTMHistoric only)
+Reference notebook demonstrating a full training run using the `DataSource` API. Trains and compares **four models** — the two architectures (`LSTMHistoric`, `LSTMEncoderDecoder`; 16 hidden, 1 layer, downscale 8 for the latter) each with two loss functions (`'mae'`, `'dilate'`) — all sharing the same `historic_cols`/`target_col`/horizon/seq_len/batch_size(256)/epochs(50):
+
+| Var | Model | Loss | Checkpoint name |
+|---|---|---|---|
+| `fc`  | `LSTMHistoric`        | `mae`    | `LSTMHistoric_test` |
+| `fc2` | `LSTMEncoderDecoder`  | `mae`    | `LSTMEncoderDecoder_test` |
+| `fc3` | `LSTMHistoric`        | `dilate` | `LSTMHistoric_dilate_test` |
+| `fc4` | `LSTMEncoderDecoder`  | `dilate` | `LSTMEncoderDecoder_dilate_test` |
+
+1. Create `DataSource` descriptors for train/val/test time windows pointing to `data/data.csv`. All three set `nodata_values=[-999]` — the target column has 84 `-999` sentinel rows (all in the 2014 tail of `test_source`), converted to `NaN`.
+2. Train each of the four `Forecaster`s in turn (`validation_score='nse'`, `validation_logging_criteria=['rmse']`, `minimize_validation_score=False`) — `loss_function='dilate'` resolves to `DILATE(alpha=0.5, gamma=0.01, use_torch_compile=True)` via `resolve_metric`; note DILATE's own `use_torch_compile` (default `True` in its constructor) is independent of `Forecaster(use_torch_compile=...)`, which stays `False` here.
+3. **Evaluation on `test_source`, for all four models** (needs `matplotlib`): after each `fc.fit()`, predictions come from `fc.predict(test_source)` directly. True values/dates come from a small separate `TimeSeriesDataset` per model, built with `target_col=TARGET_COL` purely to read off `test_ds._index`'s `(source_idx, t)` pairs for window/date alignment — not to run the model (`target_col` doesn't affect which windows get built, only `x_h`/`x_f` NaN does, so this covers the exact same windows `predict()`'s internal dataset does). Since all four models share `historic_cols`/`future_cols`/`target_col`, their four `t_values`/`y_true` arrays end up identical in practice — kept separate per model for consistency/clarity rather than deduplicated.
+4. **Plotting, all four models overlaid** in every panel:
+   - Training diagnostics: four panels — train/val loss for the two `mae`-loss models, train/val loss for the two `dilate`-loss models (split into separate panels since the two loss functions aren't on comparable scales), val_score (NSE) for all four, val RMSE for all four.
+   - Hydrograph: observed vs. predicted, lead times 1/4/7 days — color encodes lead time, linestyle encodes model.
+   - Scatter plot: observed vs. predicted per lead (1/4/7d) with a 1:1 reference line, one color per model.
+   - Flow duration curve: both series sorted descending vs. exceedance probability, log-y, one color per model.
+   - MAE and NSE vs. lead time (1–7 days) — NSE via the actual `NSE` class from `scores_and_losses`, with an explicit NaN-mask applied first since metric classes don't skip NaN the way `np.nanmean` does.

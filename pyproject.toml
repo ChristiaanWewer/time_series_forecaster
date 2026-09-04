@@ -11,4 +11,5 @@ dependencies = [
     "numpy",
     "pandas",
     "matplotlib",
+    "numba>=0.67.0",
 ]

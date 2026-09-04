@@ -106,11 +106,15 @@ class DILATE(_Metric):
         alpha: Weight between shape [1.0] and temporal [0.0] loss.
         gamma: Soft-DTW smoothing parameter (smaller = closer to hard DTW).
         use_torch_compile: Wrap the loss function with torch.compile (PyTorch 2.0+).
+            Defaults to False — Forecaster.use_torch_compile is the single source of
+            truth for whether DILATE compiles (see Forecaster.__init__'s compile-sharing
+            block, which overrides this via `_dilate_fn` when it's True). A bare DILATE()
+            should not silently self-compile independent of that.
     """
     differentiable = True
     eval_on_normalized = True  # soft-DTW overflows on large denormalized values
 
-    def __init__(self, alpha=0.5, gamma=0.01, use_torch_compile=True):
+    def __init__(self, alpha=0.5, gamma=0.01, use_torch_compile=False):
         super().__init__(dim=None)
         self.alpha = alpha
         self.gamma = gamma
