@@ -10,4 +10,5 @@ dependencies = [
     "torch",
     "numpy",
     "pandas",
+    "matplotlib",
 ]

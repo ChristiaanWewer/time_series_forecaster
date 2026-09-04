@@ -13,7 +13,8 @@ src/
   forecaster/
     forecaster.py            — training loop, normalization, logging, checkpointing
   models/
-    LSTM.py                  — LSTMHistoric and LSTMEncoderDecoder
+    lstm_historic.py         — LSTMHistoric
+    lstm_encoder_decoder.py  — LSTMEncoderDecoder
   utils/
     scores_and_losses.py     — metric classes + resolve_metric
     DILATE/
@@ -136,7 +137,7 @@ Training orchestrator. Takes `DataSource` lists, handles normalization, training
 
 ---
 
-## `src/models/LSTM.py`
+## `src/models/lstm_historic.py`, `src/models/lstm_encoder_decoder.py`
 
 Both models receive a single `config` dict. The Forecaster injects `historic_cols`, `future_cols`, `forecasting_horizon`, and `historic_input_sequence_length` into this dict automatically.
 
@@ -162,8 +163,15 @@ Both models receive a single `config` dict. The Forecaster injects `historic_col
 
 ## `check.ipynb`
 
-Reference notebook demonstrating a full training run using the new `DataSource` API:
+Reference notebook demonstrating a full training run using the `DataSource` API:
 1. Create `DataSource` descriptors for train/val/test time windows pointing to `data/data.csv`
 2. Inspect `TimeSeriesDataset` output shapes
-3. Train `LSTMHistoric` (16 hidden, 1 layer) for 5 epochs with MAE loss, RMSE val score
-4. Train `LSTMEncoderDecoder` (16 hidden, 1 layer, downscale 8) same settings
+3. Train `LSTMHistoric` (16 hidden, 1 layer) for 5 epochs with MAE loss, RMSE val score, NSE also logged via `validation_logging_criteria=['nse']`. `train_source`/`val_source`/`test_source` all set `nodata_values=[-999]` — the target column has 84 `-999` sentinel rows (all in the 2014 tail of `test_source`), converted to `NaN`.
+4. **Evaluation and plotting on `test_source`, for `LSTMHistoric` only** (needs `matplotlib`, added as a project dependency):
+   - Predictions via `fc.predict(test_source)` directly. True values come from a small separate `TimeSeriesDataset` built with `target_col=TARGET_COL` — its only purpose is reading off `test_ds._index`'s `(source_idx, t)` pairs for window/date alignment, not running the model; `target_col` doesn't affect which windows get built (only `x_h`/`x_f` NaN does), so this covers the exact same windows `predict()`'s internal dataset does. Produces aligned, denormalized `(y_true, y_pred)` arrays of shape `(n_windows, horizon)`. Dates per lead time are derived from the recovered `t` values, not assumed contiguous — `TimeSeriesDataset` may skip NaN windows.
+   - Training diagnostics: train/val loss (normalized), val_score (denormalized), and val NSE vs. epoch — three panels, since loss/val_score are on different scales and NSE is unbounded-above-zero on yet another scale
+   - Hydrograph: observed vs. predicted discharge over time, lead times 1/4/7 days overlaid
+   - Scatter plot: observed vs. predicted (lead=1d) with a 1:1 reference line
+   - Flow duration curve: both series sorted descending vs. exceedance probability, log-y
+   - MAE and NSE vs. lead time (1–7 days) — NSE computed via the actual `NSE` class from `scores_and_losses`, not a re-derived formula, with an explicit NaN-mask applied first since the metric classes don't skip NaN on their own the way `np.nanmean` does
+5. Train `LSTMEncoderDecoder` (16 hidden, 1 layer, downscale 8) same settings — no evaluation/plotting cells (LSTMHistoric only)
