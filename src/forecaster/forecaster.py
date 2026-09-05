@@ -117,6 +117,14 @@ class Forecaster:
         validation_logging_criteria = [resolve_metric(m) for m in validation_logging_criteria]
         assert_differentiable(loss_function)
 
+        # probabilistic output head: the loss function alone determines how many
+        # output channels the model needs (n_outputs=1 / output_kind='point' for
+        # ordinary losses) — see src/models/heads.py and Forecaster.__init__ below,
+        # where these get injected into model_config to size the head.
+        self.output_kind = getattr(loss_function, 'output_kind', 'point')
+        self.output_levels = getattr(loss_function, 'output_levels', None)
+        self.n_outputs = getattr(loss_function, 'n_outputs', 1)
+
         # reconstructable specs for checkpointing — not the live objects, so metric
         # configuration survives across processes/machines without pickling nn.Modules
         self.loss_function_spec = metric_to_spec(loss_function)
@@ -135,6 +143,9 @@ class Forecaster:
         self.model_config['future_cols'] = future_cols
         self.model_config['forecasting_horizon'] = forecasting_horizon
         self.model_config['historic_input_sequence_length'] = historic_input_sequence_length
+        self.model_config['n_outputs'] = self.n_outputs
+        self.model_config['output_kind'] = self.output_kind
+        self.model_config['output_levels'] = self.output_levels
         self.model = model(self.model_config)
         self.model.to(device=self.device, dtype=self.dtype)
         self._model_forward = torch.compile(self.model, dynamic=True) if use_torch_compile else self.model
@@ -189,16 +200,26 @@ class Forecaster:
         self.N_batches_per_validation_set = [len(l) for l in self.validation_loaders]
         self.N_batches_per_training_set = len(self.training_loader)
 
-        # optimizer — weight tensors (dim > 1) vs. bias/1-D params (dim <= 1) split into
-        # separate param groups so weight_decay (set via the optimizer spec string, e.g.
-        # 'adamw(weight_decay=0.01)') applies only to weights, never biases; self.regularizer
-        # reuses the same weight-only set (self._regularized_weights) for the same reason.
-        weights = [p for p in self.model.parameters() if p.dim() > 1]
-        biases = [p for p in self.model.parameters() if p.dim() <= 1]
+        # optimizer — model params split into three groups: output_head.* (the
+        # probabilistic output head — exempt from weight_decay and from
+        # self.regularizer, same reasoning as biases: a different-purpose parameter
+        # group), weight tensors (dim > 1), and remaining bias/1-D params (dim <= 1).
+        # weight_decay (set via the optimizer spec string, e.g. 'adamw(weight_decay=0.01)')
+        # applies only to the weights group; self.regularizer reuses that same
+        # weight-only set (self._regularized_weights) for the same reason.
+        weights, biases, head_params = [], [], []
+        for param_name, p in self.model.named_parameters():
+            if param_name.startswith('output_head.'):
+                head_params.append(p)
+            elif p.dim() > 1:
+                weights.append(p)
+            else:
+                biases.append(p)
         self._regularized_weights = weights
         param_groups = [
             {'params': weights},
             {'params': biases, 'weight_decay': 0.0},
+            {'params': head_params, 'weight_decay': 0.0},
         ]
         self.optimizer_spec = optimizer
         self.optimizer = _resolve_optimizer(optimizer, param_groups, self.learning_rate)
@@ -213,6 +234,13 @@ class Forecaster:
         self.validation_logging_criteria = [self.loss_function, self.validation_score] + validation_logging_criteria
         self.N_criteria = len(self.validation_logging_criteria)
         self._criteria_names = _criteria_field_names(self.validation_logging_criteria)
+
+        # bind every criterion to the loss function's own output_kind/output_levels —
+        # a no-op for metrics that never reference self._level_index, and what lets
+        # quantile-specific scores (WinklerScore/CRPS/PICP/PINAW) and the point-metric
+        # median auto-select (MAE/NSE/.../_select_point) find the right channel(s).
+        for m in self.validation_logging_criteria:
+            m.bind_levels(self.output_kind, self.output_levels)
 
         # logs — structured arrays: named fields ('loss', 'val_score', ...) instead of
         # positional indices
@@ -330,6 +358,8 @@ class Forecaster:
             fc.norm_stats = ckpt['norm_stats']
             fc.target_mean = ckpt['norm_stats'].get('target_mean')
             fc.target_std = ckpt['norm_stats'].get('target_std')
+            fc.output_kind = ckpt['model_config'].get('output_kind', 'point')
+            fc.output_levels = ckpt['model_config'].get('output_levels')
             fc.historic_cols = ckpt['historic_cols']
             fc.future_cols = ckpt['future_cols']
             fc.target_col = ckpt['target_col']
@@ -502,12 +532,20 @@ class Forecaster:
                 f'  best={self.best_logged_criterion:.4f}'
             )
 
-    def predict(self, x_test: DataSource | list[DataSource], batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=False):
+    def predict(self, x_test: DataSource | list[DataSource], batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=False, epoch=None):
         batch_size = batch_size or self.batch_size
         device = device or self.device
         if device != self.device:
             self.model.to(device)
             self.device = device
+
+        if epoch is not None:
+            # loads that epoch's saved checkpoint into self.model in place (same
+            # mechanism as load_weights, which this delegates to) — a permanent
+            # weight swap, not a scoped one, consistent with load_weights' own
+            # semantics elsewhere. self.save_path_epoch (and the checkpoint file
+            # itself) may not exist — deliberately uncaught, let it crash.
+            self.load_weights(path=self.save_path_epoch.format(epoch=epoch))
 
         if isinstance(x_test, DataSource):
             x_test = [x_test]

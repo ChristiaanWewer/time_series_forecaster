@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from src.models.heads import build_output_head
+
 
 class LSTMEncoderDecoder(nn.Module):
     def __init__(self, config):
@@ -12,6 +14,7 @@ class LSTMEncoderDecoder(nn.Module):
         encoder_downscale_layer_size = config['encoder_downscale_layer_size']
         LSTM_1_input_size = len(config['historic_cols'])
         LSTM_2_input_size = len(config['future_cols']) + encoder_downscale_layer_size
+        n_outputs = config.get('n_outputs', 1)
 
         self.encoder_lstm = nn.LSTM(
             input_size=LSTM_1_input_size,
@@ -29,7 +32,10 @@ class LSTMEncoderDecoder(nn.Module):
             batch_first=True
         )
 
-        self.output_layer = nn.Linear(in_features=LSTM_hidden_size, out_features=1)
+        self.output_head = build_output_head(
+            'sequence', LSTM_hidden_size, None, n_outputs,
+            config.get('output_kind', 'point'), config.get('output_levels'),
+        )
         self.linear_downscale_layer = nn.Linear(in_features=LSTM_hidden_size, out_features=encoder_downscale_layer_size)
 
     def forward(self, X):
@@ -43,6 +49,4 @@ class LSTMEncoderDecoder(nn.Module):
 
         # [batch_size, seq_len, hidden_size]
         x_decoded, (_, _) = self.decoder_lstm(x_encoded_linear_downscaled, (x_encoded_h, x_encoded_c))
-        x = self.output_layer(x_decoded)
-
-        return x
+        return self.output_head(x_decoded)

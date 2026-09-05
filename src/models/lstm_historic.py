@@ -1,5 +1,7 @@
 import torch.nn as nn
 
+from src.models.heads import build_output_head
+
 
 class LSTMHistoric(nn.Module):
     def __init__(self, config):
@@ -10,6 +12,7 @@ class LSTMHistoric(nn.Module):
         dropout_rate = config['dropout_rate']
         LSTM_1_input_size = len(config['historic_cols'])
         forecasting_horizon = config['forecasting_horizon']
+        n_outputs = config.get('n_outputs', 1)
 
         self.historic_lstm = nn.LSTM(
             input_size=LSTM_1_input_size,
@@ -21,11 +24,13 @@ class LSTMHistoric(nn.Module):
 
         self.dropout_layer = nn.Dropout(dropout_rate)
 
-        self.output_layer = nn.Linear(in_features=LSTM_hidden_size, out_features=forecasting_horizon)
+        self.output_head = build_output_head(
+            'pooled', LSTM_hidden_size, forecasting_horizon, n_outputs,
+            config.get('output_kind', 'point'), config.get('output_levels'),
+        )
 
     def forward(self, X):
         x_encoded_h, _ = self.historic_lstm(X['x_h'])
         x_encoded_h = x_encoded_h[:, -1, :]
         x_encoded_h = self.dropout_layer(x_encoded_h)
-        x_decoded = self.output_layer(x_encoded_h).unsqueeze(-1)
-        return x_decoded
+        return self.output_head(x_encoded_h)
