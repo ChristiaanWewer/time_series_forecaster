@@ -175,15 +175,18 @@ class _Metric(nn.Module):
         self.register_buffer('group_std', group_std)
 
     def _error(self, y_pred, y_true):
-        """Unweighted elementwise error. Overriding this (instead of forward()
-        directly) is what opts a metric into the reweight=True mechanism above."""
+        """Unweighted elementwise error, in this metric's own output shape (point
+        metrics call _select_point themselves here; multi-channel losses like
+        QuantileLoss/ExpectileLoss keep every channel). Overriding this (instead of
+        forward() directly) is what opts a metric into the reweight=True mechanism
+        above."""
         raise NotImplementedError
 
     def _plain_forward(self, y_pred, y_true, group_idx=None):
-        return self._reduce(self._error(self._select_point(y_pred), y_true))
+        return self._reduce(self._error(y_pred, y_true))
 
     def _reweighted_forward(self, y_pred, y_true, group_idx):
-        err = self._error(self._select_point(y_pred), y_true)
+        err = self._error(y_pred, y_true)
         weight = 1.0 / (self.group_std[group_idx] + self.eps) ** self._reweight_power
         weight = weight.view(-1, *([1] * (err.dim() - 1)))
         return self._reduce(err * weight)
@@ -246,7 +249,7 @@ class MAE(_Metric):
     _reweight_power = 1
 
     def _error(self, y_pred, y_true):
-        return torch.abs(y_pred - y_true)
+        return torch.abs(self._select_point(y_pred) - y_true)
 
     def _spec_kwargs(self):
         return {'reweight': True, 'eps': self.eps} if self.reweight else {}
@@ -274,7 +277,7 @@ class MSE(_Metric):
     _reweight_power = 2
 
     def _error(self, y_pred, y_true):
-        return (y_pred - y_true).pow(2)
+        return (self._select_point(y_pred) - y_true).pow(2)
 
     def _spec_kwargs(self):
         return {'reweight': True, 'eps': self.eps} if self.reweight else {}
@@ -513,33 +516,39 @@ class QuantileLoss(_Metric):
 
     Args:
         q: quantile levels to train, e.g. (0.025, 0.5, 0.975) for a 95% PI plus median.
+
+    reweight=True (see _Metric) weights each sample's pinball error by 1/(group_std+eps)
+    — std, matching pinball loss's own [y]^1 units (it's piecewise-linear in the
+    residual, same dimensional character as MAE) — using the per-series std bound via
+    bind(); see group_target_std (src/data/normalization.py) and Forecaster's wiring.
     """
     poolable = True
     spec_name = 'quantile_loss'
+    _reweight_power = 1
 
-    def __init__(self, q=(0.1, 0.5, 0.9)):
-        super().__init__(dim=None)
+    def __init__(self, q=(0.1, 0.5, 0.9), reweight=False, eps=0.1):
+        super().__init__(dim=None, reweight=reweight, eps=eps)
         self.output_levels = sorted(q)
         self.output_kind = 'quantile'
         self.n_outputs = len(self.output_levels)
         self._q = torch.tensor(self.output_levels)
 
-    def _elementwise(self, y_pred, y_true):
+    def _error(self, y_pred, y_true):
         q = self._q.to(device=y_pred.device, dtype=y_pred.dtype)
         diff = y_true - y_pred  # (B, H, 1) - (B, H, Q) broadcasts to (B, H, Q)
         return torch.maximum(q * diff, (q - 1) * diff)
 
-    def forward(self, y_pred, y_true):
-        return self._reduce(self._elementwise(y_pred, y_true))
-
     def _spec_kwargs(self):
-        return {'q': self.output_levels}
+        kwargs = {'q': self.output_levels}
+        if self.reweight:
+            kwargs.update(reweight=True, eps=self.eps)
+        return kwargs
 
     def new_accumulators(self):
         return {l: ChanAccumulator() for l in self.output_levels}
 
     def accumulate(self, accs, y_pred, y_true):
-        elem = self._elementwise(y_pred, y_true)
+        elem = self._error(y_pred, y_true)
         for i, l in enumerate(self.output_levels):
             accs[l].update(elem[..., i])
 
@@ -564,34 +573,41 @@ class ExpectileLoss(_Metric):
 
     Args:
         e: expectile levels to train, e.g. (0.025, 0.5, 0.975).
+
+    reweight=True (see _Metric) weights each sample's expectile error by
+    1/(group_std+eps)^2 — variance, matching this loss's own [y]^2 units (quadratic in
+    the residual, same dimensional character as MSE) — using the per-series std bound
+    via bind(); see group_target_std (src/data/normalization.py) and Forecaster's
+    wiring.
     """
     poolable = True
     spec_name = 'expectile_loss'
+    _reweight_power = 2
 
-    def __init__(self, e=(0.1, 0.5, 0.9)):
-        super().__init__(dim=None)
+    def __init__(self, e=(0.1, 0.5, 0.9), reweight=False, eps=0.1):
+        super().__init__(dim=None, reweight=reweight, eps=eps)
         self.output_levels = sorted(e)
         self.output_kind = 'expectile'
         self.n_outputs = len(self.output_levels)
         self._e = torch.tensor(self.output_levels)
 
-    def _elementwise(self, y_pred, y_true):
+    def _error(self, y_pred, y_true):
         e = self._e.to(device=y_pred.device, dtype=y_pred.dtype)
         u = y_true - y_pred  # (B, H, 1) - (B, H, E) broadcasts to (B, H, E)
-        weight = torch.where(u < 0, 1.0 - e, e)
-        return weight * u.pow(2)
-
-    def forward(self, y_pred, y_true):
-        return self._reduce(self._elementwise(y_pred, y_true))
+        asym_weight = torch.where(u < 0, 1.0 - e, e)
+        return asym_weight * u.pow(2)
 
     def _spec_kwargs(self):
-        return {'e': self.output_levels}
+        kwargs = {'e': self.output_levels}
+        if self.reweight:
+            kwargs.update(reweight=True, eps=self.eps)
+        return kwargs
 
     def new_accumulators(self):
         return {l: ChanAccumulator() for l in self.output_levels}
 
     def accumulate(self, accs, y_pred, y_true):
-        elem = self._elementwise(y_pred, y_true)
+        elem = self._error(y_pred, y_true)
         for i, l in enumerate(self.output_levels):
             accs[l].update(elem[..., i])
 
