@@ -135,10 +135,58 @@ class _Metric(nn.Module):
     n_outputs: int = 1
     spec_name: str | None = None  # registry key override for metric_to_spec
 
-    def __init__(self, dim=None):
+    # Group-reweighting (see MAE/MSE below): a subclass opts in purely by overriding
+    # _error() and declaring _reweight_power. None means "doesn't support it" — passing
+    # reweight=True to a metric that hasn't overridden _error raises in __init__ below.
+    # The exponent is tied to the error's own power (2 for squared error/variance, 1 for
+    # absolute error/std) so the reweighted term stays dimensionless regardless of a
+    # series' scale — see the group_mse/group_mae discussion this implements.
+    _reweight_power: int | None = None
+    needs_group_idx: bool = False
+
+    def __init__(self, dim=None, reweight=False, eps=0.1):
         super().__init__()
         self.dim = dim
         self._level_index: dict = {}
+        self.reweight = reweight
+        self.eps = eps
+        # Only metrics that implement _error() (currently MAE/MSE) participate in this
+        # dispatch — everything else keeps its own class-level forward() untouched.
+        supports_dispatch = type(self)._error is not _Metric._error
+        if reweight:
+            if not supports_dispatch or self._reweight_power is None:
+                raise ValueError(f"{type(self).__name__} does not support reweight=True")
+            self.needs_group_idx = True
+            self.register_buffer('group_std', torch.empty(0))
+            # Picked once, here, rather than branched on inside forward() every batch —
+            # an instance attribute shadows the class's forward() method, so every
+            # subsequent call dispatches straight to the right implementation with no
+            # per-call conditional.
+            self.forward = self._reweighted_forward
+        elif supports_dispatch:
+            self.forward = self._plain_forward
+
+    def bind(self, group_std: torch.Tensor) -> None:
+        """Attach the precomputed per-series std this instance reweights by (raw,
+        pre-normalization units) — called once by Forecaster, after construction,
+        the same way RLN.bind/bind_levels attach data-dependent state that can't be
+        expressed as a literal spec-string kwarg.
+        """
+        self.register_buffer('group_std', group_std)
+
+    def _error(self, y_pred, y_true):
+        """Unweighted elementwise error. Overriding this (instead of forward()
+        directly) is what opts a metric into the reweight=True mechanism above."""
+        raise NotImplementedError
+
+    def _plain_forward(self, y_pred, y_true, group_idx=None):
+        return self._reduce(self._error(self._select_point(y_pred), y_true))
+
+    def _reweighted_forward(self, y_pred, y_true, group_idx):
+        err = self._error(self._select_point(y_pred), y_true)
+        weight = 1.0 / (self.group_std[group_idx] + self.eps) ** self._reweight_power
+        weight = weight.view(-1, *([1] * (err.dim() - 1)))
+        return self._reduce(err * weight)
 
     def _reduce(self, x):
         return x.mean() if self.dim is None else x.mean(dim=self.dim)
@@ -189,11 +237,19 @@ class _Metric(nn.Module):
 
 
 class MAE(_Metric):
+    """Mean absolute error. reweight=True (see _Metric) weights each sample's error by
+    1/(group_std+eps) — std, matching absolute error's own [y]^1 units — using the
+    per-series std bound via bind(); see group_target_std (src/data/normalization.py)
+    and Forecaster's wiring of it.
+    """
     poolable = True
+    _reweight_power = 1
 
-    def forward(self, y_pred, y_true):
-        y_pred = self._select_point(y_pred)
-        return self._reduce(torch.abs(y_pred - y_true))
+    def _error(self, y_pred, y_true):
+        return torch.abs(y_pred - y_true)
+
+    def _spec_kwargs(self):
+        return {'reweight': True, 'eps': self.eps} if self.reweight else {}
 
     def new_accumulators(self):
         return {'val': ChanAccumulator()}
@@ -207,11 +263,21 @@ class MAE(_Metric):
 
 
 class MSE(_Metric):
+    """Mean squared error. reweight=True (see _Metric) weights each sample's error by
+    1/(group_std+eps)^2 — variance, matching squared error's own [y]^2 units — using the
+    per-series std bound via bind(); see group_target_std (src/data/normalization.py)
+    and Forecaster's wiring of it. Matches neuralhydrology's MaskedNSELoss formula
+    exactly (verified against its source) when applied on top of this codebase's
+    existing globally-normalized target.
+    """
     poolable = True
+    _reweight_power = 2
 
-    def forward(self, y_pred, y_true):
-        y_pred = self._select_point(y_pred)
-        return self._reduce((y_pred - y_true).pow(2))
+    def _error(self, y_pred, y_true):
+        return (y_pred - y_true).pow(2)
+
+    def _spec_kwargs(self):
+        return {'reweight': True, 'eps': self.eps} if self.reweight else {}
 
     def new_accumulators(self):
         return {'val': ChanAccumulator()}

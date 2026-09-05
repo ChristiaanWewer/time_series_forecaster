@@ -165,6 +165,20 @@ class Forecaster:
         self.target_mean = norm_stats.get('target_mean')
         self.target_std = norm_stats.get('target_std')
 
+        # group-reweighted losses (MSE/MAE with reweight=True) need each training
+        # source's own raw target std, looked up by its stable identity (DataSource.
+        # group_key) rather than list position, so a resumed run with reordered
+        # training_datasets still lines samples up with the right series — a missing
+        # key here means a series present now wasn't present when norm_stats was
+        # computed, deliberately left uncaught.
+        if getattr(loss_function, 'needs_group_idx', False):
+            group_target_std = norm_stats['group_target_std']
+            group_std = torch.tensor(
+                [group_target_std[ds.group_key] for ds in training_datasets], dtype=dtype
+            )
+            loss_function.bind(group_std)
+            loss_function.to(self.device)
+
         # datasets
         _ds_kwargs = dict(
             seq_len=historic_input_sequence_length,
@@ -440,9 +454,12 @@ class Forecaster:
 
     # ── training / evaluation ────────────────────────────────────────────────
 
-    def __training_step(self, X, y):
+    def __training_step(self, X, y, group_idx=None):
         y_pred = self._model_forward(X)
-        loss = self.loss_function(y_pred, y)
+        if getattr(self.loss_function, 'needs_group_idx', False):
+            loss = self.loss_function(y_pred, y, group_idx)
+        else:
+            loss = self.loss_function(y_pred, y)
         self.optimizer.zero_grad()
         loss.backward()
         if self.regularizer is not None:
@@ -459,8 +476,9 @@ class Forecaster:
             valid = ~y.isnan().any(dim=(1, 2))
             if not valid.any():
                 continue
-            X = {k: v.to(self.device)[valid] for k, v in batch.items() if k != 'y'}
-            loss += self.__training_step(X, y[valid])
+            X = {k: v.to(self.device)[valid] for k, v in batch.items() if k not in ('y', 'group_idx')}
+            group_idx = batch['group_idx'].to(self.device)[valid] if 'group_idx' in batch else None
+            loss += self.__training_step(X, y[valid], group_idx)
             n += 1
         self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
 
@@ -478,7 +496,7 @@ class Forecaster:
                 valid = ~y.isnan().any(dim=(1, 2))
                 if not valid.any():
                     continue
-                X = {k: v.to(self.device)[valid] for k, v in batch.items() if k != 'y'}
+                X = {k: v.to(self.device)[valid] for k, v in batch.items() if k not in ('y', 'group_idx')}
                 y_valid = y[valid]
                 y_pred = self._model_forward(X)
                 y_pred_d = y_pred * self.target_std + self.target_mean
@@ -569,7 +587,7 @@ class Forecaster:
         preds = []
         with torch.no_grad():
             for batch in loader:
-                X = {k: v.to(device) for k, v in batch.items() if k != 'y'}
+                X = {k: v.to(device) for k, v in batch.items() if k not in ('y', 'group_idx')}
                 preds.append(self._model_forward(X))
         preds = torch.cat(preds, dim=0)
         if denormalize:

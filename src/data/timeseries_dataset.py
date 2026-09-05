@@ -87,6 +87,7 @@ class TimeSeriesDataset(Dataset):
         result = {
             'x_h': torch.tensor(xh, dtype=self._dtype),
             'x_f': torch.tensor(xf, dtype=self._dtype),
+            'group_idx': torch.tensor(src_idx, dtype=torch.long),
         }
         if all_y is not None:
             y = all_y[t + self._seq_len:t + self._seq_len + self._horizon].copy()

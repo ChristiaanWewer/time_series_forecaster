@@ -60,6 +60,7 @@ def compute_norm_stats(
 
     accum: dict[str, tuple[float, float, float]] = {c: (0.0, 0.0, 0.0) for c in all_cols}
     target_accum = (0.0, 0.0, 0.0)
+    group_accum: dict[str, tuple[float, float, float]] = {}
 
     binary_cols: set[str] = set()
     for source in sources:
@@ -95,6 +96,8 @@ def compute_norm_stats(
                 mean_b = float(target_vals.mean())
                 M2_b = float(((target_vals - mean_b) ** 2).sum())
                 target_accum = _merge_stats(*target_accum, n_b, mean_b, M2_b)
+                key = source.group_key
+                group_accum[key] = _merge_stats(*group_accum.get(key, (0.0, 0.0, 0.0)), n_b, mean_b, M2_b)
 
     if has_1d:
         xh_mean, xh_std = [], []
@@ -124,6 +127,11 @@ def compute_norm_stats(
         n, mean, M2 = target_accum
         stats['target_mean'] = float(mean)
         stats['target_std'] = max(float(np.sqrt(M2 / (n - 1))) if n >= 2 else 1.0, 1e-8)
+
+        stats['group_target_std'] = {
+            key: max(float(np.sqrt(M2_g / (n_g - 1))) if n_g >= 2 else 1.0, 1e-8)
+            for key, (n_g, _, M2_g) in group_accum.items()
+        }
 
     stats['binary_cols'] = binary_cols
 

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class DataSource:
+    name: str | None = None  # stable identity for this series; falls back to csv/netcdf_1d path if unset
     start: str | None = None
     end: str | None = None
     csv: str | None = None
@@ -17,3 +18,14 @@ class DataSource:
             raise ValueError("At least one of csv or netcdf_1d must be set")
         if self.netcdf_1d and not self.netcdf_1d_vars:
             raise ValueError("netcdf_1d_vars is required when netcdf_1d is set")
+
+    @property
+    def group_key(self) -> str:
+        """Stable identity for this series, used to key per-series statistics (e.g.
+        normalization.compute_norm_stats' group_target_std) across runs and checkpoint
+        resumes. Falls back to the already-required, already-stable csv/netcdf_1d path
+        when `name` isn't set, so multiple date-range DataSource entries for the same
+        underlying series (e.g. separate train/val windows) share one key without
+        requiring `name` to be set explicitly.
+        """
+        return self.name or self.csv or self.netcdf_1d
