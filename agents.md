@@ -12,6 +12,8 @@ src/
   forecaster/
     forecaster.py            — training loop, normalization, logging, checkpointing
   models/
+    base.py                  — BaseForecastModel (shared scaffolding: embeddings, common config, parameter_breakdown)
+    embeddings.py             — EmbeddingNetwork, InputEmbedding, build_embeddings (per-timestep input embedding groups)
     lstm_historic.py         — LSTMHistoric
     lstm_encoder_decoder.py  — LSTMEncoderDecoder
     heads.py                 — PooledHead, SequenceHead (output projections, shared across models)
@@ -122,6 +124,8 @@ Training orchestrator. Takes `DataSource` lists, handles normalization, training
 
 **Output head sizing.** Right after resolving `loss_function`, `Forecaster` reads `output_kind`/`output_levels`/`n_outputs` straight off it (`getattr(..., default)`, so plain losses like `'mae'` are unaffected — `output_kind='point'`, `n_outputs=1`) and stores them as `self.output_kind`/`self.output_levels`/`self.n_outputs`. All three get injected into `self.model_config` (next to `historic_cols`, `forecasting_horizon`, etc.) before `self.model = model(self.model_config)` — this is what lets `loss_function='quantile_loss(q=[...])'` alone drive the model's output head width (see `heads.py` above). It's also how every other resolved criterion gets bound: right after `self.validation_logging_criteria` is assembled, `Forecaster` calls `m.bind_levels(self.output_kind, self.output_levels)` on each entry, unconditionally (see the probabilistic-scores section above).
 
+**`compute_number_of_parameters()`** returns the bare total parameter count (int). **`print_parameter_breakdown()`** prints `self.model.parameter_breakdown()` (see `BaseForecastModel` below) as an aligned table — one row per embedding group, a backbone row, a head row, then a ruled `total` row.
+
 **Weight decay / regularization apply to weights only, never biases or the output head.** At construction, `self.model.named_parameters()` is split once into three groups: `output_head.*` (by name — the probabilistic output head, always exempt), `weights` (`p.dim() > 1` — every `nn.Linear.weight`, `nn.LSTM`'s `weight_ih_*`/`weight_hh_*`), and `biases` (`p.dim() <= 1` — every `*.bias`). The optimizer is built from three `param_groups`, with the bias and head groups both pinned to `weight_decay=0.0` regardless of what the `optimizer` spec string sets for the weights group. `self._regularized_weights` (= `weights`, excluding both biases and the head) is passed to `self.regularizer` for the same reason. This changes `self.optimizer.param_groups` from 2 groups to 3 relative to checkpoints saved before this was introduced — `load_model(resume=True)` on one of those now raises (no backward compatibility is maintained for pre-this-change checkpoints, same as the earlier 1→2 group change when `regularization=` replaced `l1_lambda`).
 
 `__training_step` calls `self.regularizer.step(self._regularized_weights)` right after `loss.backward()` (so it sees the plain data gradient in `p.grad`) and before `optimizer.step()` — regularizers mutate `p.grad` in place rather than adding anything to the loss graph, so `self.loss_log` is purely the data loss regardless of `regularization`. `__evaluate_model` is a fully separate code path (never calls `__training_step`) and never touches the regularizer either way — every validation metric, including `validation_logging_criteria[0]` (the bare loss function), always reflects the un-regularized value.
@@ -157,13 +161,66 @@ In `__train_model`, `batch['group_idx']` is sliced by the same NaN `valid` mask 
 
 ---
 
+## `src/models/base.py` — `BaseForecastModel`
+
+Shared scaffolding every model subclasses, regardless of backbone architecture — introduced so embeddings and common config-reading are homogeneous across models instead of being wired (or forgotten) per model file, and so the base class carries no architecture-specific naming (no model family beyond LSTMs exists yet, but nothing here assumes one).
+
+`__init__(self, config)` — same single-positional-arg signature `Forecaster.__init__` requires (`self.model = model(self.model_config)`); every subclass calls `super().__init__(config)` first, then builds its own backbone layers.
+
+Builds and stores, from `config`:
+- `self.embedding_h`, `self.embedding_f` — via `build_embeddings(config, config['historic_cols'], config['future_cols'])` (see `embeddings.py` below). Always built, even with no `'embeddings'` key configured (pure passthrough then) — this is what guarantees every model gets the same input-embedding mechanism for free, fixing the earlier gap where only one model wired embeddings in.
+- `self.historic_input_size`, `self.future_input_size` — `embedding_h.output_size`/`embedding_f.output_size`; subclasses size their own layers off these rather than raw `len(historic_cols)`/`len(future_cols)`.
+- `self.hidden_size`, `self.num_layers`, `self.dropout_rate` — from `config['hidden_size']`/`config['num_layers']`/`config['dropout_rate']` (required, no default). Deliberately generic names, not `LSTM_*` — every model family reads these the same way regardless of backbone type.
+- `self.forecasting_horizon`, `self.n_outputs`, `self.output_kind`, `self.output_levels` — the values `Forecaster` injects into `model_config` unconditionally (see below) get read once here instead of redundantly in each subclass.
+
+Rule for what belongs in the base vs. a subclass: any config value `Forecaster` injects unconditionally, or that's generic across backbone types, lives here; anything that only makes sense for one architecture (e.g. `LSTMEncoderDecoder`'s downscale-layer width) stays a plain `config[...]` read inside that subclass's own `__init__`.
+
+**`embed(X)`** — `(self.embedding_h(X['x_h']), self.embedding_f(X['x_f']))`, the standard way a subclass's `forward` gets its (possibly embedded) inputs. A model with no future/decoder branch (`LSTMHistoric`) calls `self.embedding_h(X['x_h'])` directly instead, to avoid running the unused future-side embedding every step.
+
+**`build_output_head(representation, in_features, horizon=None)`** — thin wrapper around `heads.build_output_head`, filling in `self.n_outputs`/`self.output_kind`/`self.output_levels` so a subclass only supplies what's actually architecture-specific.
+
+**`parameter_breakdown()`** — returns `[(label, param_count), ...]`: one row per configured embedding group (labeled by that group's required, unique `name`, see `embeddings.py`), a backbone row (labeled `type(self).__name__` — the model's own class name — counting everything not under `embedding_h.`/`embedding_f.`/`output_head.`, computed by exclusion so it needs no per-architecture bookkeeping), a head row (labeled `type(self.output_head).__name__`), and a final `('total', ...)` row equal to the sum of the rest. `Forecaster.print_parameter_breakdown()` renders this as an aligned table (see below); `Forecaster.compute_number_of_parameters()` still returns just the bare total int for programmatic use.
+
+---
+
+## `src/models/embeddings.py` — `EmbeddingNetwork`, `InputEmbedding`, `build_embeddings`
+
+Per-timestep input embeddings, model-agnostic (wired in uniformly via `BaseForecastModel`, not per model).
+
+**`EmbeddingNetwork(in_features, embedding_dim, num_layers=1, hidden_size=None, output_activation=None)`** — a plain `nn.Linear` at `num_layers=1` (broadcasts over every leading dim for free — no explicit time loop needed, same trick `SequenceHead` uses), an MLP with `GELU` between hidden layers at `num_layers>1`. `output_activation`: `None`/`'gelu'`/`'softmax'`.
+
+**`InputEmbedding(cols, group_specs, networks)`** — applies each group's network to its slice of `cols` and concatenates the outputs (config order) with the untouched passthrough columns (raw columns claimed by no group, original order). `networks[i] is None` means that group doesn't apply to this side and is skipped. `.output_size` is the resulting last-dim width; `.networks` is an `nn.ModuleList` of only the groups actually live on this side.
+
+**`build_embeddings(config, historic_cols, future_cols)`** — reads `config.get('embeddings') or []`, a list of group-spec dicts:
+
+```python
+{
+    'name': str,                 # required, unique — labels this group in parameter_breakdown()
+    'variables': [...],          # column names, checked explicitly against historic_cols/future_cols
+    'embedding_dim': int,
+    'num_layers': int = 1,
+    'hidden_size': int = embedding_dim,
+    'output_activation': None | 'gelu' | 'softmax' = None,
+    'historic': bool,            # required — apply this group on the historic side?
+    'future': bool,              # required — apply this group on the future side?
+}
+```
+
+Validation is strict, by design — a typo or config mistake crashes rather than silently producing a smaller/wrong embedding: `name` must be present, non-empty, and unique across the config's groups; both `historic`/`future` keys must be present and at least one `True`; if `historic=True`, every `variables` entry must be in `historic_cols` (else `ValueError` listing what's missing), symmetrically for `future=True`/`future_cols`.
+
+A group with **both** `historic=True` and `future=True` gets a single shared `EmbeddingNetwork` instance applied to both sides — weight sharing is automatic whenever a group spans both sides, not a separate opt-in flag. Independent (unshared) per-side networks over the same columns are expressed as **two** groups instead — one `historic`-only, one `future`-only — each getting its own instance; this fully replaces what an earlier `share_weights` flag did, with no loss of expressiveness.
+
+Returns `(embedding_h, embedding_f, group_networks)` — `group_networks: list[tuple[name, nn.Module]]`, one entry per config group (parallel order), the source `BaseForecastModel.parameter_breakdown()` reports from. No `'embeddings'` key (or an empty list) makes both `InputEmbedding`s pure passthroughs (`output_size == len(cols)`), so models that don't opt in are unaffected.
+
+---
+
 ## `src/models/lstm_historic.py`, `src/models/lstm_encoder_decoder.py`, `src/models/heads.py`
 
-Both models receive a single `config` dict. The Forecaster injects `historic_cols`, `future_cols`, `forecasting_horizon`, `historic_input_sequence_length`, and (see below) `n_outputs`/`output_kind`/`output_levels` into this dict automatically.
+Both models subclass `BaseForecastModel` (above) and receive a single `config` dict — the base class reads the shared/injected keys; each subclass reads only its own architecture-specific keys directly off `config` (e.g. `LSTMEncoderDecoder`'s `encoder_downscale_layer_size`).
 
-`X` is an **open dict** — models read only the keys they need and silently ignore the rest. Existing models use `X['x_h']` and `X['x_f']`.
+`X` is an **open dict** — models read only the keys they need and silently ignore the rest. Existing models use `X['x_h']` and `X['x_f']` (via `self.embed(X)` or `self.embedding_h(X['x_h'])` — see `BaseForecastModel.embed` above).
 
-Neither model owns its final projection directly anymore — each builds its output head via `heads.build_output_head(representation, in_features, horizon, n_outputs, output_kind, output_levels)`, always assigned to the attribute `self.output_head` (`Forecaster` keys off this exact name to exclude its params from regularization — see below). `n_outputs` defaults to `1`/`output_kind` to `'point'` via `config.get(...)`, so old configs keep working unchanged. Two backbone shapes (passed as `representation`), two raw head classes:
+Neither model owns its final projection directly — each builds its output head via `self.build_output_head(representation, in_features, horizon=None)` (the `BaseForecastModel` wrapper around `heads.build_output_head`), always assigned to the attribute `self.output_head` (`Forecaster` keys off this exact name to exclude its params from regularization — see below). Two backbone shapes (passed as `representation`), two raw head classes:
 
 - **`PooledHead(in_features, horizon, n_outputs)`** (`representation='pooled'`) — for a backbone that produces one pooled vector per sample, `(B, hidden)`. `nn.Linear(hidden, horizon * n_outputs)`, reshaped to `(B, horizon, n_outputs)`.
 - **`SequenceHead(in_features, n_outputs)`** (`representation='sequence'`) — for a backbone that already produces a per-timestep representation, `(B, horizon, hidden)`. Plain `nn.Linear(hidden, n_outputs)` (broadcasts over the middle dim for free).
@@ -285,7 +342,7 @@ Reference notebook demonstrating a full training run using the `DataSource` API.
 
 ## `examples/example_regularization_rln.ipynb`
 
-Second reference notebook, same `DataSource`/`HISTORIC_COLS`/`TARGET_COL`/`HORIZON`/`SEQ_LEN` setup as `example_model_and_loss_comparison.ipynb`, demonstrating `regularization='rln(...)'` specifically. Trains two identical `LSTMHistoric` models (`mae` loss, `LSTM_hidden_size=28`, 50 epochs) differing only in `regularization`: `fc_baseline` (`None`) vs. `fc_rln` (`'rln(theta=-8.0)'`). `theta` is dataset/architecture-dependent (see `RLN`'s docstring) — `-8.0` was found by sweeping `[-4, -6, -7, -8, -9, -10]` on this exact setup; `-4.0` (a naive first guess) collapsed the model entirely (99.8% of weights crushed to ~0, NSE went negative and never recovered — regularization overwhelmed the data gradient from the very first step, since every weight starts at `exp(theta)` uniformly). `-8.0` gives a real demonstration of the paper's claim without sacrificing much accuracy: RLN reaches best NSE 0.79 vs. the baseline's 0.81, while driving ~71% of weights below `1e-3` vs. the baseline's ~0.6%.
+Second reference notebook, same `DataSource`/`HISTORIC_COLS`/`TARGET_COL`/`HORIZON`/`SEQ_LEN` setup as `example_model_and_loss_comparison.ipynb`, demonstrating `regularization='rln(...)'` specifically. Trains two identical `LSTMHistoric` models (`mae` loss, `hidden_size=28`, 50 epochs) differing only in `regularization`: `fc_baseline` (`None`) vs. `fc_rln` (`'rln(theta=-8.0)'`). `theta` is dataset/architecture-dependent (see `RLN`'s docstring) — `-8.0` was found by sweeping `[-4, -6, -7, -8, -9, -10]` on this exact setup; `-4.0` (a naive first guess) collapsed the model entirely (99.8% of weights crushed to ~0, NSE went negative and never recovered — regularization overwhelmed the data gradient from the very first step, since every weight starts at `exp(theta)` uniformly). `-8.0` gives a real demonstration of the paper's claim without sacrificing much accuracy: RLN reaches best NSE 0.79 vs. the baseline's 0.81, while driving ~71% of weights below `1e-3` vs. the baseline's ~0.6%.
 
 `plot_weight_magnitudes(models: dict[str, Forecaster], threshold=1e-3)` — defined inline in the notebook (not extracted to `src/`, matching `example_model_and_loss_comparison.ipynb`'s convention that plotting stays notebook-local): flattens every tensor in `fc._regularized_weights` per model into `|weight|`, then two panels — sorted-descending `|weight|` vs. rank (log-y) on the left, and a density histogram of `|weight|` (log-y) on the right, both overlaid across models — plus prints the fraction below `threshold` per model. The histogram makes RLN's effect visible a second way: a sharp density spike near 0 next to the baseline's much flatter, wider spread. Everything after that (training diagnostics, hydrograph, scatter, NSE-vs-lead-time) reuses `example_model_and_loss_comparison.ipynb`'s cell patterns, simplified from four models down to two.
 
@@ -293,7 +350,7 @@ Second reference notebook, same `DataSource`/`HISTORIC_COLS`/`TARGET_COL`/`HORIZ
 
 ## `examples/example_probabilistic_forecasting.ipynb`
 
-Third reference notebook, same `DataSource`/`HISTORIC_COLS`/`TARGET_COL`/`HORIZON`/`SEQ_LEN` setup as `example_model_and_loss_comparison.ipynb`/`example_regularization_rln.ipynb`, demonstrating the probabilistic output head (`quantile_loss`/`expectile_loss`, `src/models/heads.py`) and the new evaluation scores (`winkler_score`, `crps`, `scrps`, `coverage_gap`, `pinaw`). `CoverageGap` is displayed multiplied by 100 everywhere in this notebook (training diagnostics, coverage-gap-vs-lead-time, axis labels all say "(%)") since it's a coverage-probability difference and reads more naturally as a percentage than a fraction. Trains two `LSTMHistoric` models (`LSTM_hidden_size=28`, 30 epochs), identical except for the loss:
+Third reference notebook, same `DataSource`/`HISTORIC_COLS`/`TARGET_COL`/`HORIZON`/`SEQ_LEN` setup as `example_model_and_loss_comparison.ipynb`/`example_regularization_rln.ipynb`, demonstrating the probabilistic output head (`quantile_loss`/`expectile_loss`, `src/models/heads.py`) and the new evaluation scores (`winkler_score`, `crps`, `scrps`, `coverage_gap`, `pinaw`). `CoverageGap` is displayed multiplied by 100 everywhere in this notebook (training diagnostics, coverage-gap-vs-lead-time, axis labels all say "(%)") since it's a coverage-probability difference and reads more naturally as a percentage than a fraction. Trains two `LSTMHistoric` models (`hidden_size=28`, 30 epochs), identical except for the loss:
 
 | Var | Loss | `output_kind` |
 |---|---|---|

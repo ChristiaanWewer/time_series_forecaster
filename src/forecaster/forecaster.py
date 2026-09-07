@@ -279,6 +279,20 @@ class Forecaster:
     def compute_number_of_parameters(self):
         return sum(p.numel() for p in self.model.parameters())
 
+    def print_parameter_breakdown(self):
+        rows = self.model.parameter_breakdown()
+        counts = [f'{count:,}' for _, count in rows]
+        label_width = max(len(label) for label, _ in rows)
+        count_width = max(len(c) for c in counts)
+        rule = '-' * (label_width + count_width + 2)
+
+        print(rule)
+        for (label, _), count in zip(rows[:-1], counts[:-1]):
+            print(f'{label:<{label_width}}  {count:>{count_width}}')
+        print(rule)
+        label, count = rows[-1][0], counts[-1]
+        print(f'{label:<{label_width}}  {count:>{count_width}}')
+
     def load_weights(self, path=None):
         if path is None:
             path = self.save_path_best
