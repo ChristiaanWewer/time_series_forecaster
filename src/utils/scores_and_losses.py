@@ -1,4 +1,3 @@
-import ast
 import math
 import torch
 import torch.nn as nn
@@ -6,7 +5,21 @@ import torch.nn as nn
 from src.data.normalization import _merge_stats
 
 
-REGISTRY: dict = {}  # populated after class definitions
+def _require_bound_levels(metric) -> None:
+    """CRPS/SCRPS/RSCRPS iterate self._level_index.items() rather than doing a direct
+    self._level_index[level] lookup (unlike WinklerScore/PICP/PINAW) — an empty dict
+    (bind_levels never called, or a point-kind head) would otherwise silently select
+    zero channels and produce a NaN instead of a loud failure. Called first thing in
+    each of their channel-selection methods to keep the same "deliberately uncaught,
+    fail loudly" convention every other level-dependent metric already gets for free
+    from a direct dict lookup.
+    """
+    if not metric._level_index:
+        raise KeyError(
+            f"{type(metric).__name__} requires a bound quantile/expectile output head "
+            "— self._level_index is empty (bind_levels was never called, or the "
+            "model's output head has no levels)"
+        )
 
 
 class ChanAccumulator:
@@ -35,54 +48,6 @@ class ChanAccumulator:
     @property
     def variance(self) -> float:
         return self.M2 / self.n if self.n > 1 else float('nan')
-
-
-def parse_spec(spec: str) -> tuple[str, dict]:
-    """Parse 'name' or 'name(kw=val, ...)' into (name.lower(), kwargs), kwargs values via
-    ast.literal_eval. Shared grammar for resolve_metric and Forecaster's optimizer spec.
-    """
-    spec = spec.strip()
-    if '(' in spec:
-        call = ast.parse(spec, mode='eval').body
-        return call.func.id.lower(), {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
-    return spec.lower(), {}
-
-
-def resolve_metric(metric):
-    """Accept a metric instance or a name string and return an instance.
-
-    Supported string forms:
-        'mae'                           — no-arg instantiation
-        'DILATE(alpha=0.5, gamma=0.01)' — kwargs parsed safely via ast
-    """
-    if not isinstance(metric, str):
-        return metric
-    name, kwargs = parse_spec(metric)
-    if name not in REGISTRY:
-        raise ValueError(f"Unknown metric '{metric}'. Available: {list(REGISTRY)}")
-    return REGISTRY[name](**kwargs)
-
-
-def metric_to_spec(metric) -> str:
-    """Inverse of resolve_metric: a metric instance -> a string resolve_metric can parse
-    back into an equivalent instance. Used to make a metric's configuration checkpointable
-    without pickling the live nn.Module — a compiled DILATE holds a torch.compile closure
-    that isn't reliably picklable across processes/machines.
-
-    DILATE keeps its own explicit branch (unchanged, pre-dating spec_name/_spec_kwargs).
-    Every other parametrized metric (QuantileLoss, ExpectileLoss, WinklerScore, PICP,
-    PINAW, ...) controls its own round-trip via spec_name (registry key override; None
-    falls back to the old type(metric).__name__.lower() behavior) and _spec_kwargs()
-    (empty by default -> a bare name, matching MAE/MSE/NSE/... today).
-    """
-    if isinstance(metric, DILATE):
-        return f'DILATE(alpha={metric.alpha}, gamma={metric.gamma})'
-    name = metric.spec_name or type(metric).__name__.lower()
-    kwargs = metric._spec_kwargs()
-    if not kwargs:
-        return name
-    kw_str = ', '.join(f'{k}={v!r}' for k, v in kwargs.items())
-    return f'{name}({kw_str})'
 
 
 def assert_differentiable(metric):
@@ -133,7 +98,6 @@ class _Metric(nn.Module):
     output_kind: str = 'point'
     output_levels: list | None = None
     n_outputs: int = 1
-    spec_name: str | None = None  # registry key override for metric_to_spec
 
     # Group-reweighting (see MAE/MSE below): a subclass opts in purely by overriding
     # _error() and declaring _reweight_power. None means "doesn't support it" — passing
@@ -170,7 +134,7 @@ class _Metric(nn.Module):
         """Attach the precomputed per-series std this instance reweights by (raw,
         pre-normalization units) — called once by Forecaster, after construction,
         the same way RLN.bind/bind_levels attach data-dependent state that can't be
-        expressed as a literal spec-string kwarg.
+        known until after this instance is constructed.
         """
         self.register_buffer('group_std', group_std)
 
@@ -221,11 +185,6 @@ class _Metric(nn.Module):
         idx = self._level_index[0.5]
         return y_pred[..., idx:idx + 1]
 
-    def _spec_kwargs(self) -> dict:
-        """Kwargs metric_to_spec embeds in this metric's spec string, e.g.
-        {'alpha': 0.5} for WinklerScore. Empty (default) means a bare class name."""
-        return {}
-
     def new_accumulators(self) -> dict:
         """Fresh named ChanAccumulator(s) this metric needs for pooled computation."""
         return {}
@@ -251,9 +210,6 @@ class MAE(_Metric):
     def _error(self, y_pred, y_true):
         return torch.abs(self._select_point(y_pred) - y_true)
 
-    def _spec_kwargs(self):
-        return {'reweight': True, 'eps': self.eps} if self.reweight else {}
-
     def new_accumulators(self):
         return {'val': ChanAccumulator()}
 
@@ -278,9 +234,6 @@ class MSE(_Metric):
 
     def _error(self, y_pred, y_true):
         return (self._select_point(y_pred) - y_true).pow(2)
-
-    def _spec_kwargs(self):
-        return {'reweight': True, 'eps': self.eps} if self.reweight else {}
 
     def new_accumulators(self):
         return {'val': ChanAccumulator()}
@@ -523,7 +476,6 @@ class QuantileLoss(_Metric):
     bind(); see group_target_std (src/data/normalization.py) and Forecaster's wiring.
     """
     poolable = True
-    spec_name = 'quantile_loss'
     _reweight_power = 1
 
     def __init__(self, q=(0.1, 0.5, 0.9), reweight=False, eps=0.1):
@@ -537,12 +489,6 @@ class QuantileLoss(_Metric):
         q = self._q.to(device=y_pred.device, dtype=y_pred.dtype)
         diff = y_true - y_pred  # (B, H, 1) - (B, H, Q) broadcasts to (B, H, Q)
         return torch.maximum(q * diff, (q - 1) * diff)
-
-    def _spec_kwargs(self):
-        kwargs = {'q': self.output_levels}
-        if self.reweight:
-            kwargs.update(reweight=True, eps=self.eps)
-        return kwargs
 
     def new_accumulators(self):
         return {l: ChanAccumulator() for l in self.output_levels}
@@ -581,7 +527,6 @@ class ExpectileLoss(_Metric):
     wiring.
     """
     poolable = True
-    spec_name = 'expectile_loss'
     _reweight_power = 2
 
     def __init__(self, e=(0.1, 0.5, 0.9), reweight=False, eps=0.1):
@@ -596,12 +541,6 @@ class ExpectileLoss(_Metric):
         u = y_true - y_pred  # (B, H, 1) - (B, H, E) broadcasts to (B, H, E)
         asym_weight = torch.where(u < 0, 1.0 - e, e)
         return asym_weight * u.pow(2)
-
-    def _spec_kwargs(self):
-        kwargs = {'e': self.output_levels}
-        if self.reweight:
-            kwargs.update(reweight=True, eps=self.eps)
-        return kwargs
 
     def new_accumulators(self):
         return {l: ChanAccumulator() for l in self.output_levels}
@@ -634,7 +573,6 @@ class WinklerScore(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'winkler_score'
 
     def __init__(self, alpha):
         super().__init__(dim=None)
@@ -659,9 +597,6 @@ class WinklerScore(_Metric):
     def forward(self, y_pred, y_true):
         return self._reduce(self._elementwise(y_pred, y_true))
 
-    def _spec_kwargs(self):
-        return {'alpha': self.alpha}
-
     def new_accumulators(self):
         return {'val': ChanAccumulator()}
 
@@ -683,7 +618,6 @@ class PICP(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'picp'
 
     def __init__(self, alpha):
         super().__init__(dim=None)
@@ -699,9 +633,6 @@ class PICP(_Metric):
 
     def forward(self, y_pred, y_true):
         return self._reduce(self._elementwise(y_pred, y_true))
-
-    def _spec_kwargs(self):
-        return {'alpha': self.alpha}
 
     def new_accumulators(self):
         return {'val': ChanAccumulator()}
@@ -727,8 +658,6 @@ class CoverageGap(PICP):
     mean(x - c) == mean(x) - c exactly (mean is linear), so this doesn't bias the
     pooled epoch-level value the way shifting a per-batch average would.
     """
-    spec_name = 'coverage_gap'
-
     def _elementwise(self, y_pred, y_true):
         return super()._elementwise(y_pred, y_true) - (1 - self.alpha)
 
@@ -744,7 +673,6 @@ class PINAW(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'pinaw'
 
     def __init__(self, alpha):
         super().__init__(dim=None)
@@ -761,9 +689,6 @@ class PINAW(_Metric):
         width = self._width(y_pred)
         r = (y_true.max() - y_true.min()).clamp(min=1e-8)
         return width.mean() / r
-
-    def _spec_kwargs(self):
-        return {'alpha': self.alpha}
 
     def new_accumulators(self):
         return {'width': ChanAccumulator(), 'ymin': float('inf'), 'ymax': float('-inf')}
@@ -794,9 +719,9 @@ class CRPS(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'crps'
 
     def _elementwise(self, y_pred, y_true):
+        _require_bound_levels(self)
         items = sorted(self._level_index.items())
         idx = [i for _, i in items]
         levels = torch.tensor([l for l, _ in items], device=y_pred.device, dtype=y_pred.dtype)
@@ -845,9 +770,9 @@ class SCRPS(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'scrps'
 
     def _terms(self, y_pred, y_true):
+        _require_bound_levels(self)
         items = sorted(self._level_index.items())
         idx = [i for _, i in items]
         levels = torch.tensor([l for l, _ in items], device=y_pred.device, dtype=y_pred.dtype)
@@ -913,16 +838,13 @@ class RSCRPS(_Metric):
     """
     differentiable = False
     poolable = True
-    spec_name = 'rscrps'
 
     def __init__(self, c):
         super().__init__(dim=None)
         self.c = c
 
-    def _spec_kwargs(self):
-        return {'c': self.c}
-
     def _terms(self, y_pred, y_true):
+        _require_bound_levels(self)
         items = sorted(self._level_index.items())
         idx = [i for _, i in items]
         yq = y_pred[..., idx]  # (..., Q)
@@ -950,25 +872,3 @@ class RSCRPS(_Metric):
         num = accs['num'].mean
         denom = max(accs['denom'].mean, 1e-8)
         return -(num / denom) - 0.5 * math.log(denom)
-
-
-REGISTRY = {
-    'mae': MAE,
-    'mse': MSE,
-    'rmse': RMSE,
-    'mape': MAPE,
-    'smape': SMAPE,
-    'dilate': DILATE,
-    'nse': NSE,
-    'alpha_nse': AlphaNSE,
-    'beta_nse': BetaNSE,
-    'quantile_loss': QuantileLoss,
-    'expectile_loss': ExpectileLoss,
-    'winkler_score': WinklerScore,
-    'crps': CRPS,
-    'scrps': SCRPS,
-    'rscrps': RSCRPS,
-    'picp': PICP,
-    'coverage_gap': CoverageGap,
-    'pinaw': PINAW,
-}

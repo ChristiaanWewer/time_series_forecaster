@@ -1,30 +1,28 @@
 import torch
 
-from src.utils.scores_and_losses import parse_spec
-
-
-REGISTRY: dict = {}  # populated after class definitions
-
 
 class _Regularizer:
     """Base class for Forecaster's pluggable weight regularizers. Never touches the
     loss graph — Forecaster.__training_step calls step() right after loss.backward()
     (p.grad already holds the plain data gradient) and before optimizer.step().
     Subclasses may mutate p.grad in place and hold state across steps (see RLN).
-    Only ever sees the weight-only parameter list (biases excluded — same convention
-    Forecaster already uses for L2/weight_decay).
+    Only ever sees one weight-only parameter pool — either the embedding weights or
+    the backbone weights (see Forecaster's embedding_regularization/model_regularizer,
+    both bound separately since embeddings and the model backbone are now two
+    independently-owned pieces). Biases and the output head are never regularized.
     """
     def bind(self, params: list[torch.nn.Parameter], lr: float) -> None:
-        """Called once at Forecaster construction: the weight-only parameter list,
-        and the Forecaster's own learning_rate (so a regularizer's own rate, if
-        unset, can default to it — see RLN)."""
+        """Called once by Forecaster, after the relevant module (embeddings or model)
+        has been bound and its real parameters exist: the weight-only parameter list,
+        and a learning rate (so a regularizer's own rate, if unset, can default to it
+        — see RLN)."""
         pass
 
     def step(self, params: list[torch.nn.Parameter]) -> None:
         raise NotImplementedError
 
     def get_state(self) -> dict:
-        """Checkpointable state beyond __init__'s own spec kwargs (e.g. RLN's
+        """Checkpointable state beyond __init__'s own settings (e.g. RLN's
         learned per-weight coefficients). Empty for stateless regularizers."""
         return {}
 
@@ -44,16 +42,16 @@ class RLN(_Regularizer):
             *next* step's g, reusing that step's already-computed gradient (no extra
             backward pass) — this is the paper's efficiency trick.
 
-    lambda is then re-centered so its mean across every weight in the network equals
+    lambda is then re-centered so its mean across every weight in its pool equals
     `theta` (a simplex projection) — without this lambda drifts to -inf and
-    regularization collapses network-wide. theta is the one hyperparameter this
-    replaces the whole per-weight search with.
+    regularization collapses. theta is the one hyperparameter this replaces the
+    whole per-weight search with.
 
     Args:
         theta: target mean of the per-weight log-coefficients (tune via CV — this
             replaces what would otherwise be a per-weight hyperparameter search).
         lr: learning rate for the coefficients themselves (nu in the paper);
-            defaults to the Forecaster's own learning_rate if not given.
+            defaults to whatever Forecaster passes into bind() if not given.
     """
     def __init__(self, theta=-4.0, lr=None):
         self.theta = theta
@@ -93,9 +91,9 @@ class RLN(_Regularizer):
         self._lambdas = [t.to(self._lambdas[0].device) for t in state['lambdas']]
 
 
-class L1(_Regularizer):
-    """Flat L1 — one shared coefficient for every weight. The trivial case of the
-    same interface RLN uses (one shared lambda instead of one lambda per weight).
+class L1Regularizer(_Regularizer):
+    """Flat L1 — one shared coefficient for every weight in its pool. The trivial
+    case of the same interface RLN uses (one shared lambda instead of one per weight).
     """
     def __init__(self, lambda_=0.01):
         self.lambda_ = lambda_
@@ -106,14 +104,17 @@ class L1(_Regularizer):
                 p.grad += self.lambda_ * torch.sign(p.data)
 
 
-def resolve_regularization(spec):
-    """None -> None. String forms: 'l1(lambda_=0.01)', 'rln(theta=-4.0, lr=0.01)'."""
-    if spec is None:
-        return None
-    name, kwargs = parse_spec(spec)
-    if name not in REGISTRY:
-        raise ValueError(f"Unknown regularizer '{spec}'. Available: {list(REGISTRY)}")
-    return REGISTRY[name](**kwargs)
+class L2Regularizer(_Regularizer):
+    """Flat L2 — one shared coefficient for every weight in its pool, applied the same
+    way L1Regularizer is (a gradient-space penalty added in step(), not folded into the
+    loss graph). Deliberately independent of the optimizer's own weight_decay kwarg —
+    the two are not mutually exclusive and may be combined; it's on the caller to avoid
+    double-penalizing if that's not intended.
+    """
+    def __init__(self, gamma=0.01):
+        self.gamma = gamma
 
-
-REGISTRY = {'l1': L1, 'rln': RLN}
+    def step(self, params):
+        if self.gamma:
+            for p in params:
+                p.grad += self.gamma * p.data

@@ -13,3 +13,14 @@ dependencies = [
     "matplotlib",
     "numba>=0.67.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.10.0",
+    "nbconvert>=7.17.1",
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

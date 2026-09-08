@@ -1,4 +1,3 @@
-import copy
 import operator
 import os
 
@@ -10,31 +9,13 @@ from torch.utils.data import DataLoader
 from src.data.datasource import DataSource
 from src.data.normalization import compute_norm_stats
 from src.data.timeseries_dataset import TimeSeriesDataset
-from src.utils.regularization import resolve_regularization
-from src.utils.scores_and_losses import assert_differentiable, metric_to_spec, parse_spec, resolve_metric
+from src.optim import Adam
+from src.utils.scores_and_losses import MAE, assert_differentiable
 
 
 def _collate_fn(batch: list[dict]) -> dict:
     common_keys = set.intersection(*[set(item.keys()) for item in batch])
     return {k: torch.stack([item[k] for item in batch]) for k in sorted(common_keys)}
-
-
-_OPTIMIZER_REGISTRY = {
-    name.lower(): cls for name, cls in vars(torch.optim).items()
-    if isinstance(cls, type) and issubclass(cls, torch.optim.Optimizer) and cls is not torch.optim.Optimizer
-}
-
-
-def _resolve_optimizer(spec: str, params, lr: float) -> torch.optim.Optimizer:
-    """Build an optimizer from a spec string, e.g. 'adam' or 'adamw(weight_decay=0.01)' or
-    'sgd(momentum=0.9, weight_decay=1e-4)' — same grammar as resolve_metric's loss specs
-    (see scores_and_losses.parse_spec). An 'lr' kwarg inside the string overrides `lr`.
-    """
-    name, kwargs = parse_spec(spec)
-    if name not in _OPTIMIZER_REGISTRY:
-        raise ValueError(f"Unknown optimizer '{spec}'. Available: {list(_OPTIMIZER_REGISTRY)}")
-    lr = kwargs.pop('lr', lr)
-    return _OPTIMIZER_REGISTRY[name](params, lr=lr, **kwargs)
 
 
 def _criteria_field_names(criteria: list) -> list[str]:
@@ -55,23 +36,25 @@ class Forecaster:
     def __init__(
             self,
             model,
-            model_config,
             name,
             training_datasets: list[DataSource],
             validation_datasets: list[DataSource],
+            loss,
+            embeddings: list | None = None,
+            validation_score=None,
+            validation_logging_criteria: list | None = None,
+            optimizer=None,
+            embedding_regularization=None,
+            model_regularizer=None,
             historic_cols=None,
             future_cols=None,
             target_col='y',
             forecasting_horizon=7,
             historic_input_sequence_length=365,
             save_path='/',
-            loss_function='mae',
-            validation_score='mae',
             minimize_validation_score=True,
             save_aggregation_criterion='mean',
-            validation_logging_criteria=None,
             number_of_epochs=100,
-            learning_rate=0.001,
             batch_size=512,
             num_workers=0,
             prefetch_factor=2,
@@ -80,8 +63,6 @@ class Forecaster:
             shuffle=True,
             dtype=torch.float32,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-            optimizer='adam',
-            regularization=None,
             seed=42,
             use_torch_compile=False,
             save_weights_every_n_epochs=1,
@@ -91,15 +72,21 @@ class Forecaster:
             historic_cols = []
         if future_cols is None:
             future_cols = []
+        if embeddings is None:
+            embeddings = []
+        if validation_score is None:
+            validation_score = MAE()
         if validation_logging_criteria is None:
-            validation_logging_criteria = ['mae']
+            validation_logging_criteria = [MAE()]
+        if optimizer is None:
+            optimizer = Adam(lr=0.001)
+
         self.device = device
         self.seed = seed
         torch.manual_seed(self.seed)
         self.name = name
         self.dtype = dtype
         self.batch_size = batch_size
-        self.learning_rate = learning_rate
         self.number_of_epochs = number_of_epochs
         self.aggregation_criterion = save_aggregation_criterion
         self.minimize_validation_score = minimize_validation_score
@@ -111,25 +98,15 @@ class Forecaster:
         self.save_path = save_path
         self._start_epoch = 0
 
-        # resolve string metric names
-        loss_function = resolve_metric(loss_function)
-        self.validation_score = resolve_metric(validation_score)
-        validation_logging_criteria = [resolve_metric(m) for m in validation_logging_criteria]
-        assert_differentiable(loss_function)
+        assert_differentiable(loss)
 
-        # probabilistic output head: the loss function alone determines how many
-        # output channels the model needs (n_outputs=1 / output_kind='point' for
-        # ordinary losses) — see src/models/heads.py and Forecaster.__init__ below,
-        # where these get injected into model_config to size the head.
-        self.output_kind = getattr(loss_function, 'output_kind', 'point')
-        self.output_levels = getattr(loss_function, 'output_levels', None)
-        self.n_outputs = getattr(loss_function, 'n_outputs', 1)
-
-        # reconstructable specs for checkpointing — not the live objects, so metric
-        # configuration survives across processes/machines without pickling nn.Modules
-        self.loss_function_spec = metric_to_spec(loss_function)
-        self.validation_score_spec = metric_to_spec(self.validation_score)
-        self.validation_logging_criteria_specs = [metric_to_spec(m) for m in validation_logging_criteria]
+        # probabilistic output head: the loss alone determines how many output
+        # channels the model needs (n_outputs=1 / output_kind='point' for ordinary
+        # losses) — see src/models/heads.py and the model.bind() call below, which
+        # sizes the head from these.
+        self.output_kind = getattr(loss, 'output_kind', 'point')
+        self.output_levels = getattr(loss, 'output_levels', None)
+        self.n_outputs = getattr(loss, 'n_outputs', 1)
 
         self.save_operator = operator.lt if minimize_validation_score else operator.gt
         self.best_logged_criterion = (
@@ -137,23 +114,9 @@ class Forecaster:
             else np.array(-np.inf, dtype=np.float32)
         )
 
-        # model
-        self.model_config = copy.deepcopy(model_config)
-        self.model_config['historic_cols'] = historic_cols
-        self.model_config['future_cols'] = future_cols
-        self.model_config['forecasting_horizon'] = forecasting_horizon
-        self.model_config['historic_input_sequence_length'] = historic_input_sequence_length
-        self.model_config['n_outputs'] = self.n_outputs
-        self.model_config['output_kind'] = self.output_kind
-        self.model_config['output_levels'] = self.output_levels
-        self.model = model(self.model_config)
-        self.model.to(device=self.device, dtype=self.dtype)
-        self._model_forward = torch.compile(self.model, dynamic=True) if use_torch_compile else self.model
-
-        # normalization stats computed on training data only; applied to both train and val.
-        # Pass norm_stats explicitly (e.g. when resuming) to reuse the exact prior stats
-        # instead of recomputing them, so the datasets built below stay consistent with
-        # what the restored model/optimizer were actually trained against.
+        # normalization stats computed on training data only; applied to both train and
+        # val. Pass norm_stats explicitly (e.g. when resuming) to reuse the exact prior
+        # stats instead of recomputing them.
         if norm_stats is None:
             norm_stats = compute_norm_stats(
                 sources=training_datasets,
@@ -165,19 +128,19 @@ class Forecaster:
         self.target_mean = norm_stats.get('target_mean')
         self.target_std = norm_stats.get('target_std')
 
-        # group-reweighted losses (MSE/MAE with reweight=True) need each training
-        # source's own raw target std, looked up by its stable identity (DataSource.
-        # group_key) rather than list position, so a resumed run with reordered
-        # training_datasets still lines samples up with the right series — a missing
-        # key here means a series present now wasn't present when norm_stats was
-        # computed, deliberately left uncaught.
-        if getattr(loss_function, 'needs_group_idx', False):
+        # group-reweighted losses (reweight=True) need each training source's own raw
+        # target std, looked up by its stable identity (DataSource.group_key) rather
+        # than list position, so a resumed run with reordered training_datasets still
+        # lines samples up with the right series — a missing key here means a series
+        # present now wasn't present when norm_stats was computed, deliberately
+        # uncaught.
+        if getattr(loss, 'needs_group_idx', False):
             group_target_std = norm_stats['group_target_std']
             group_std = torch.tensor(
                 [group_target_std[ds.group_key] for ds in training_datasets], dtype=dtype
             )
-            loss_function.bind(group_std)
-            loss_function.to(self.device)
+            loss.bind(group_std)
+            loss.to(self.device)
 
         # datasets
         _ds_kwargs = dict(
@@ -214,45 +177,66 @@ class Forecaster:
         self.N_batches_per_validation_set = [len(l) for l in self.validation_loaders]
         self.N_batches_per_training_set = len(self.training_loader)
 
-        # optimizer — model params split into three groups: output_head.* (the
-        # probabilistic output head — exempt from weight_decay and from
-        # self.regularizer, same reasoning as biases: a different-purpose parameter
-        # group), weight tensors (dim > 1), and remaining bias/1-D params (dim <= 1).
-        # weight_decay (set via the optimizer spec string, e.g. 'adamw(weight_decay=0.01)')
-        # applies only to the weights group; self.regularizer reuses that same
-        # weight-only set (self._regularized_weights) for the same reason.
-        weights, biases, head_params = [], [], []
+        # embeddings + model: bind embeddings to the actual column layout, combine
+        # them (+ passthrough columns) into the historic/future feature pipeline, then
+        # bind the model to the resulting input sizes and the loss-derived output shape.
+        self._bind_embeddings_and_model(
+            embeddings, model, historic_cols, future_cols,
+            forecasting_horizon, self.n_outputs, self.output_kind, self.output_levels,
+        )
+        self.model.to(device=self.device, dtype=self.dtype)
+        for net in self.embeddings:
+            net.to(device=self.device, dtype=self.dtype)
+        self._model_forward = torch.compile(self.model, dynamic=True) if use_torch_compile else self.model
+
+        # optimizer — params split into five groups: embedding weights/biases, backbone
+        # weights/biases, and the output head (dim>1 vs dim<=1, same as before; the
+        # output head is identified by the 'output_head.' name prefix and is always
+        # exempt from weight_decay and from regularization, same reasoning as biases).
+        embedding_weights, embedding_biases = [], []
+        for net in self.embeddings:
+            for p in net.parameters():
+                (embedding_weights if p.dim() > 1 else embedding_biases).append(p)
+
+        backbone_weights, backbone_biases, head_params = [], [], []
         for param_name, p in self.model.named_parameters():
             if param_name.startswith('output_head.'):
                 head_params.append(p)
             elif p.dim() > 1:
-                weights.append(p)
+                backbone_weights.append(p)
             else:
-                biases.append(p)
-        self._regularized_weights = weights
+                backbone_biases.append(p)
+
+        self._embedding_weights = embedding_weights
+        self._backbone_weights = backbone_weights
         param_groups = [
-            {'params': weights},
-            {'params': biases, 'weight_decay': 0.0},
+            {'params': embedding_weights},
+            {'params': embedding_biases, 'weight_decay': 0.0},
+            {'params': backbone_weights},
+            {'params': backbone_biases, 'weight_decay': 0.0},
             {'params': head_params, 'weight_decay': 0.0},
         ]
-        self.optimizer_spec = optimizer
-        self.optimizer = _resolve_optimizer(optimizer, param_groups, self.learning_rate)
+        self.optimizer = optimizer.bind(param_groups)
+        self.learning_rate = optimizer.lr
 
-        self.regularization_spec = regularization
-        self.regularizer = resolve_regularization(regularization)
-        if self.regularizer is not None:
-            self.regularizer.bind(self._regularized_weights, self.learning_rate)
+        self.embedding_regularizer = embedding_regularization
+        if self.embedding_regularizer is not None:
+            self.embedding_regularizer.bind(embedding_weights, self.learning_rate)
+        self.model_regularizer = model_regularizer
+        if self.model_regularizer is not None:
+            self.model_regularizer.bind(backbone_weights, self.learning_rate)
 
         # loss & logging criteria
-        self.loss_function = loss_function
-        self.validation_logging_criteria = [self.loss_function, self.validation_score] + validation_logging_criteria
+        self.loss = loss
+        self.validation_score = validation_score
+        self.validation_logging_criteria = [self.loss, self.validation_score] + validation_logging_criteria
         self.N_criteria = len(self.validation_logging_criteria)
         self._criteria_names = _criteria_field_names(self.validation_logging_criteria)
 
-        # bind every criterion to the loss function's own output_kind/output_levels —
-        # a no-op for metrics that never reference self._level_index, and what lets
-        # quantile-specific scores (WinklerScore/CRPS/PICP/PINAW) and the point-metric
-        # median auto-select (MAE/NSE/.../_select_point) find the right channel(s).
+        # bind every criterion to the loss's own output_kind/output_levels — a no-op for
+        # metrics that never reference self._level_index, and what lets quantile-specific
+        # scores (WinklerScore/CRPS/PICP/PINAW) and the point-metric median auto-select
+        # (MAE/NSE/.../_select_point) find the right channel(s).
         for m in self.validation_logging_criteria:
             m.bind_levels(self.output_kind, self.output_levels)
 
@@ -274,13 +258,65 @@ class Forecaster:
             self.save_path_best = os.path.join(self.save_path, f'model_{name}_best.pt')
             self.save_path_epoch = os.path.join(self.save_path, f'model_{name}_epoch_{{epoch}}.pt')
 
+    # ── embeddings ───────────────────────────────────────────────────────────
+
+    def _bind_embeddings_and_model(self, embeddings, model, historic_cols, future_cols,
+                                    forecasting_horizon, n_outputs, output_kind, output_levels):
+        names = [net.name for net in embeddings]
+        if len(set(names)) != len(names):
+            raise ValueError(f"embedding names must be unique, got: {names}")
+        for net in embeddings:
+            net.bind(historic_cols, future_cols)
+        self.embeddings = embeddings
+
+        self._embed_h_nets, self._embed_h_passthrough, h_size = self._prepare_side(
+            embeddings, historic_cols, '_historic_idx')
+        self._embed_f_nets, self._embed_f_passthrough, f_size = self._prepare_side(
+            embeddings, future_cols, '_future_idx')
+
+        model.bind(
+            historic_input_size=h_size, future_input_size=f_size,
+            forecasting_horizon=forecasting_horizon,
+            n_outputs=n_outputs, output_kind=output_kind, output_levels=output_levels,
+        )
+        self.model = model
+
+    @staticmethod
+    def _prepare_side(embeddings, cols, idx_attr):
+        applicable = [(net, getattr(net, idx_attr)) for net in embeddings if getattr(net, idx_attr) is not None]
+        claimed = set()
+        for _, idx in applicable:
+            claimed.update(idx)
+        passthrough = [i for i in range(len(cols)) if i not in claimed]
+        output_size = sum(net.embedding_dim for net, _ in applicable) + len(passthrough)
+        return applicable, passthrough, output_size
+
+    @staticmethod
+    def _embed_side(x, nets, passthrough_idx):
+        parts = [net(x[..., idx]) for net, idx in nets]
+        if passthrough_idx:
+            parts.append(x[..., passthrough_idx])
+        return torch.cat(parts, dim=-1) if parts else x
+
+    def _embed(self, x_h, x_f):
+        return (
+            self._embed_side(x_h, self._embed_h_nets, self._embed_h_passthrough),
+            self._embed_side(x_f, self._embed_f_nets, self._embed_f_passthrough),
+        )
+
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def compute_number_of_parameters(self):
-        return sum(p.numel() for p in self.model.parameters())
+        total = sum(p.numel() for net in self.embeddings for p in net.parameters())
+        return total + sum(p.numel() for p in self.model.parameters())
 
     def print_parameter_breakdown(self):
-        rows = self.model.parameter_breakdown()
+        embed_rows = [(net.name, sum(p.numel() for p in net.parameters())) for net in self.embeddings]
+        model_rows = self.model.parameter_breakdown()
+        embedding_total = sum(count for _, count in embed_rows)
+        model_total = model_rows[-1][1]
+        rows = embed_rows + model_rows[:-1] + [('total', embedding_total + model_total)]
+
         counts = [f'{count:,}' for _, count in rows]
         label_width = max(len(label) for label, _ in rows)
         count_width = max(len(c) for c in counts)
@@ -293,36 +329,47 @@ class Forecaster:
         label, count = rows[-1][0], counts[-1]
         print(f'{label:<{label_width}}  {count:>{count_width}}')
 
+    def _split_model_state_dict(self):
+        full = self.model.state_dict()
+        head = {k[len('output_head.'):]: v for k, v in full.items() if k.startswith('output_head.')}
+        backbone = {k: v for k, v in full.items() if not k.startswith('output_head.')}
+        return backbone, head
+
+    def _load_model_and_embeddings_state(self, ckpt):
+        backbone, head = ckpt['model']['backbone'], ckpt['model']['head']
+        full = {**backbone, **{f'output_head.{k}': v for k, v in head.items()}}
+        self.model.load_state_dict(full)
+        embeddings_by_name = {net.name: net for net in self.embeddings}
+        for name, state in ckpt['embeddings'].items():
+            embeddings_by_name[name].load_state_dict(state)
+
     def load_weights(self, path=None):
         if path is None:
             path = self.save_path_best
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        state_dict = ckpt['state_dict']
-        if any(k.startswith('_orig_mod.') for k in state_dict):
-            state_dict = {k.removeprefix('_orig_mod.'): v for k, v in state_dict.items()}
-        self.model.load_state_dict(state_dict)
+        self._load_model_and_embeddings_state(ckpt)
         if self._model_forward is not self.model:
             self._model_forward = torch.compile(self.model, dynamic=True)
 
     def _checkpoint_dict(self, epoch: int) -> dict:
+        backbone, head = self._split_model_state_dict()
         return {
-            'state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epoch': epoch,
-            'best_logged_criterion': self.best_logged_criterion,
+            'model': {'backbone': backbone, 'head': head},
+            'embeddings': {net.name: net.state_dict() for net in self.embeddings},
             'norm_stats': self.norm_stats,
-            'model_config': self.model_config,
             'historic_cols': self.historic_cols,
             'future_cols': self.future_cols,
             'target_col': self.target_col,
             'forecasting_horizon': self.forecasting_horizon,
             'historic_input_sequence_length': self.historic_input_sequence_length,
-            'loss_function_spec': self.loss_function_spec,
-            'validation_score_spec': self.validation_score_spec,
-            'validation_logging_criteria_specs': self.validation_logging_criteria_specs,
-            'optimizer_spec': self.optimizer_spec,
-            'regularization_spec': self.regularization_spec,
-            'regularizer_state': self.regularizer.get_state() if self.regularizer else None,
+            'n_outputs': self.n_outputs,
+            'output_kind': self.output_kind,
+            'output_levels': self.output_levels,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'embedding_regularizer_state': self.embedding_regularizer.get_state() if self.embedding_regularizer else None,
+            'model_regularizer_state': self.model_regularizer.get_state() if self.model_regularizer else None,
+            'best_logged_criterion': self.best_logged_criterion,
+            'epoch': epoch,
             'minimize_validation_score': self.minimize_validation_score,
             'save_aggregation_criterion': self.aggregation_criterion,
             'criteria_names': self._criteria_names,
@@ -336,7 +383,14 @@ class Forecaster:
             cls,
             checkpoint_path: str,
             model,
-            resume: bool,
+            embeddings: list | None = None,
+            resume: bool = False,
+            loss=None,
+            validation_score=None,
+            validation_logging_criteria: list | None = None,
+            optimizer=None,
+            embedding_regularization=None,
+            model_regularizer=None,
             training_datasets: list[DataSource] | None = None,
             validation_datasets: list[DataSource] | None = None,
             device='cpu',
@@ -347,53 +401,59 @@ class Forecaster:
             learning_rate=None,
             **forecaster_kwargs,
     ) -> 'Forecaster':
-        """Load a Forecaster from a checkpoint saved by fit().
+        """Load a Forecaster from a checkpoint saved by fit(). Checkpoints hold only
+        learned state (weights, optimizer momentum, regularizer state, logs) — never
+        reconstructable hyperparameters — so `model`/`embeddings` (and, for resume,
+        every other component: loss/validation_score/optimizer/regularizers) must be
+        the same unbound objects you'd hand to a fresh Forecaster() call.
 
         Three modes:
-        - training_datasets=None: inference only. Builds just the model and loads its
-          weights; no optimizer, loaders, or logs. Works on a machine that never had the
-          training data.
-        - resume=True (requires training_datasets): continues the same run. Restores
-          weights, optimizer state (momentum/Adam moments), norm_stats, the loss/score
-          config, and the epoch counter and log history — all pulled from the checkpoint,
-          not re-specified, so a resumed run cannot silently diverge from the original.
-          `learning_rate` optionally overrides just the restored optimizer's LR (e.g. for
-          decaying it on a fine-tuning continuation) without discarding its momentum state.
+        - training_datasets=None: inference only. Binds model/embeddings using the
+          schema and output shape saved in the checkpoint, then loads weights. No
+          optimizer, loaders, or regularizers.
+        - resume=True (requires training_datasets and every other component):
+          continues the same run — a full Forecaster() construction, then weights,
+          optimizer state, regularizer state, and log history are loaded on top from
+          the checkpoint. `learning_rate`, if given, overwrites just the restored
+          optimizer's LR (keeps momentum/Adam moment state).
         - resume=False + training_datasets given: a fresh run warm-started from these
-          weights as an initialization — fresh optimizer, fresh norm_stats (computed from
-          whatever training_datasets are passed now), fresh logs starting at epoch 0.
-          model_config/historic_cols/etc. must be supplied via forecaster_kwargs here,
-          the same as a normal Forecaster(...) call.
-
-        use_torch_compile is applied after weights are loaded (matching load_weights),
-        not before — compiling is a runtime choice for wherever you're loading, not a
-        fact saved in the checkpoint.
+          weights as an initialization — fresh optimizer, fresh norm_stats, fresh
+          logs at epoch 0; only weights are loaded.
         """
         if resume and training_datasets is None:
             raise ValueError("resume=True requires training_datasets to continue training.")
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        embeddings = embeddings or []
 
         if training_datasets is None:
             fc = cls.__new__(cls)
             fc.device = device
-            fc.model_config = ckpt['model_config']
-            fc.model = model(fc.model_config)
-            fc.model.load_state_dict(ckpt['state_dict'])
-            fc.model.to(device=device)
-            fc.dtype = next(fc.model.parameters()).dtype
-            fc._model_forward = torch.compile(fc.model, dynamic=True) if use_torch_compile else fc.model
-            fc.norm_stats = ckpt['norm_stats']
-            fc.target_mean = ckpt['norm_stats'].get('target_mean')
-            fc.target_std = ckpt['norm_stats'].get('target_std')
-            fc.output_kind = ckpt['model_config'].get('output_kind', 'point')
-            fc.output_levels = ckpt['model_config'].get('output_levels')
             fc.historic_cols = ckpt['historic_cols']
             fc.future_cols = ckpt['future_cols']
             fc.target_col = ckpt['target_col']
             fc.forecasting_horizon = ckpt['forecasting_horizon']
             fc.historic_input_sequence_length = ckpt['historic_input_sequence_length']
+            fc.norm_stats = ckpt['norm_stats']
+            fc.target_mean = ckpt['norm_stats'].get('target_mean')
+            fc.target_std = ckpt['norm_stats'].get('target_std')
+            fc.output_kind = ckpt['output_kind']
+            fc.output_levels = ckpt['output_levels']
+            fc.n_outputs = ckpt['n_outputs']
+
+            fc._bind_embeddings_and_model(
+                embeddings, model, fc.historic_cols, fc.future_cols,
+                fc.forecasting_horizon, fc.n_outputs, fc.output_kind, fc.output_levels,
+            )
+            fc._load_model_and_embeddings_state(ckpt)
+            fc.model.to(device=device)
+            for net in fc.embeddings:
+                net.to(device=device)
+            fc.dtype = next(fc.model.parameters()).dtype
+            fc._model_forward = torch.compile(fc.model, dynamic=True) if use_torch_compile else fc.model
             fc.batch_size = batch_size
+            fc.embedding_regularizer = None
+            fc.model_regularizer = None
             # training history, so a loaded-for-inference Forecaster still supports the
             # same post-hoc plotting (loss/val_score curves) a freshly-trained one does
             fc.loss_log = ckpt['loss_log']
@@ -404,34 +464,25 @@ class Forecaster:
 
         if resume:
             fc = cls(
-                model=model,
-                model_config=ckpt['model_config'],
-                training_datasets=training_datasets,
-                validation_datasets=validation_datasets or [],
-                historic_cols=ckpt['historic_cols'],
-                future_cols=ckpt['future_cols'],
-                target_col=ckpt['target_col'],
-                forecasting_horizon=ckpt['forecasting_horizon'],
+                model=model, embeddings=embeddings, loss=loss, validation_score=validation_score,
+                validation_logging_criteria=validation_logging_criteria,
+                optimizer=optimizer, embedding_regularization=embedding_regularization,
+                model_regularizer=model_regularizer,
+                training_datasets=training_datasets, validation_datasets=validation_datasets or [],
+                historic_cols=ckpt['historic_cols'], future_cols=ckpt['future_cols'],
+                target_col=ckpt['target_col'], forecasting_horizon=ckpt['forecasting_horizon'],
                 historic_input_sequence_length=ckpt['historic_input_sequence_length'],
-                loss_function=ckpt['loss_function_spec'],
-                validation_score=ckpt['validation_score_spec'],
-                validation_logging_criteria=ckpt['validation_logging_criteria_specs'],
-                minimize_validation_score=ckpt['minimize_validation_score'],
-                save_aggregation_criterion=ckpt['save_aggregation_criterion'],
                 norm_stats=ckpt['norm_stats'],
-                optimizer=ckpt['optimizer_spec'],
-                regularization=ckpt['regularization_spec'],
-                device=device,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
+                device=device, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
                 use_torch_compile=False,
                 **forecaster_kwargs,
             )
-            fc.model.load_state_dict(ckpt['state_dict'])
+            fc._load_model_and_embeddings_state(ckpt)
             fc.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            if fc.regularizer is not None:
-                fc.regularizer.load_state(ckpt['regularizer_state'])
+            if fc.embedding_regularizer is not None:
+                fc.embedding_regularizer.load_state(ckpt['embedding_regularizer_state'])
+            if fc.model_regularizer is not None:
+                fc.model_regularizer.load_state(ckpt['model_regularizer_state'])
             if learning_rate is not None:
                 for group in fc.optimizer.param_groups:
                     group['lr'] = learning_rate
@@ -450,17 +501,16 @@ class Forecaster:
                 fc.val_log_aggregated[key][:start_epoch] = ckpt['val_log_aggregated'][key][:start_epoch]
         else:
             fc = cls(
-                model=model,
-                training_datasets=training_datasets,
-                validation_datasets=validation_datasets or [],
-                device=device,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
+                model=model, embeddings=embeddings, loss=loss, validation_score=validation_score,
+                validation_logging_criteria=validation_logging_criteria,
+                optimizer=optimizer, embedding_regularization=embedding_regularization,
+                model_regularizer=model_regularizer,
+                training_datasets=training_datasets, validation_datasets=validation_datasets or [],
+                device=device, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
                 use_torch_compile=False,
                 **forecaster_kwargs,
             )
-            fc.model.load_state_dict(ckpt['state_dict'])
+            fc._load_model_and_embeddings_state(ckpt)
 
         if use_torch_compile:
             fc._model_forward = torch.compile(fc.model, dynamic=True)
@@ -468,21 +518,25 @@ class Forecaster:
 
     # ── training / evaluation ────────────────────────────────────────────────
 
-    def __training_step(self, X, y, group_idx=None):
-        y_pred = self._model_forward(X)
-        if getattr(self.loss_function, 'needs_group_idx', False):
-            loss = self.loss_function(y_pred, y, group_idx)
+    def __training_step(self, x_h, x_f, y, group_idx=None):
+        y_pred = self._model_forward(x_h, x_f)
+        if getattr(self.loss, 'needs_group_idx', False):
+            loss = self.loss(y_pred, y, group_idx)
         else:
-            loss = self.loss_function(y_pred, y)
+            loss = self.loss(y_pred, y)
         self.optimizer.zero_grad()
         loss.backward()
-        if self.regularizer is not None:
-            self.regularizer.step(self._regularized_weights)
+        if self.embedding_regularizer is not None:
+            self.embedding_regularizer.step(self._embedding_weights)
+        if self.model_regularizer is not None:
+            self.model_regularizer.step(self._backbone_weights)
         self.optimizer.step()
         return loss.detach()
 
     def __train_model(self, epoch):
         self.model.train()
+        for net in self.embeddings:
+            net.train()
         loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         n = 0
         for batch in self.training_loader:
@@ -490,15 +544,19 @@ class Forecaster:
             valid = ~y.isnan().any(dim=(1, 2))
             if not valid.any():
                 continue
-            X = {k: v.to(self.device)[valid] for k, v in batch.items() if k not in ('y', 'group_idx')}
+            x_h = batch['x_h'].to(self.device)[valid]
+            x_f = batch['x_f'].to(self.device)[valid]
+            x_h, x_f = self._embed(x_h, x_f)
             group_idx = batch['group_idx'].to(self.device)[valid] if 'group_idx' in batch else None
-            loss += self.__training_step(X, y[valid], group_idx)
+            loss += self.__training_step(x_h, x_f, y[valid], group_idx)
             n += 1
         self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
 
     @torch.no_grad()
     def __evaluate_model(self, epoch):
         self.model.eval()
+        for net in self.embeddings:
+            net.eval()
         metrics = self.validation_logging_criteria
         poolable = [getattr(m, 'poolable', False) for m in metrics]
         for i, loader in enumerate(self.validation_loaders):
@@ -510,13 +568,15 @@ class Forecaster:
                 valid = ~y.isnan().any(dim=(1, 2))
                 if not valid.any():
                     continue
-                X = {k: v.to(self.device)[valid] for k, v in batch.items() if k not in ('y', 'group_idx')}
+                x_h = batch['x_h'].to(self.device)[valid]
+                x_f = batch['x_f'].to(self.device)[valid]
+                x_h, x_f = self._embed(x_h, x_f)
                 y_valid = y[valid]
-                y_pred = self._model_forward(X)
+                y_pred = self._model_forward(x_h, x_f)
                 y_pred_d = y_pred * self.target_std + self.target_mean
                 y_d      = y_valid * self.target_std + self.target_mean
                 for idx, m in enumerate(metrics):
-                    # index 0 (the loss function) always sees normalized values, matching
+                    # index 0 (the loss) always sees normalized values, matching
                     # __training_step; the rest see denormalized unless eval_on_normalized
                     use_normalized = idx == 0 or getattr(m, 'eval_on_normalized', False)
                     yp, yt = (y_pred, y_valid) if use_normalized else (y_pred_d, y_d)
@@ -569,14 +629,15 @@ class Forecaster:
         device = device or self.device
         if device != self.device:
             self.model.to(device)
+            for net in self.embeddings:
+                net.to(device)
             self.device = device
 
         if epoch is not None:
-            # loads that epoch's saved checkpoint into self.model in place (same
-            # mechanism as load_weights, which this delegates to) — a permanent
-            # weight swap, not a scoped one, consistent with load_weights' own
-            # semantics elsewhere. self.save_path_epoch (and the checkpoint file
-            # itself) may not exist — deliberately uncaught, let it crash.
+            # loads that epoch's saved checkpoint into self.model/self.embeddings in
+            # place (same mechanism as load_weights, which this delegates to) — a
+            # permanent weight swap, not a scoped one. self.save_path_epoch (and the
+            # checkpoint file itself) may not exist — deliberately uncaught, let it crash.
             self.load_weights(path=self.save_path_epoch.format(epoch=epoch))
 
         if isinstance(x_test, DataSource):
@@ -598,11 +659,15 @@ class Forecaster:
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, **_loader_kwargs)
 
         self.model.eval()
+        for net in self.embeddings:
+            net.eval()
         preds = []
         with torch.no_grad():
             for batch in loader:
-                X = {k: v.to(device) for k, v in batch.items() if k not in ('y', 'group_idx')}
-                preds.append(self._model_forward(X))
+                x_h = batch['x_h'].to(device)
+                x_f = batch['x_f'].to(device)
+                x_h, x_f = self._embed(x_h, x_f)
+                preds.append(self._model_forward(x_h, x_f))
         preds = torch.cat(preds, dim=0)
         if denormalize:
             preds = preds * self.target_std + self.target_mean
