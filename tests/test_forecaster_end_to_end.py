@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 import torch
 
-from src.data.datasource import DataSource
+from src.data import DataSource, TimeSeriesData
 from src.forecaster import Forecaster
 from src.models import LSTMEncoderDecoder, LSTMHistoric, EmbeddingNetwork
 from src.optim import AdamW
@@ -29,8 +29,8 @@ def csv_path(tmp_path):
 
 
 def test_fit_predict_checkpoint_roundtrip(tmp_path, csv_path):
-    train_src = DataSource(csv=csv_path, start='2020-01-01', end='2020-10-31')
-    val_src = DataSource(csv=csv_path, start='2020-11-01', end='2020-12-31')
+    train_data = TimeSeriesData([DataSource(csv=csv_path, start='2020-01-01', end='2020-10-31')])
+    val_data = TimeSeriesData([DataSource(csv=csv_path, start='2020-11-01', end='2020-12-31')])
 
     landuse = EmbeddingNetwork(name='landuse', variables=['landuse_code'], embedding_dim=4, historic=True, future=False)
     model = LSTMHistoric(hidden_size=8, num_layers=1, dropout_rate=0.0)
@@ -38,7 +38,7 @@ def test_fit_predict_checkpoint_roundtrip(tmp_path, csv_path):
     fc = Forecaster(
         model=model, name='e2e', embeddings=[landuse], loss=MAE(),
         optimizer=AdamW(lr=0.01), model_regularizer=L1Regularizer(lambda_=0.001),
-        training_datasets=[train_src], validation_datasets=[val_src],
+        training_data=train_data, validation_data=val_data,
         historic_cols=['temp', 'precip', 'landuse_code'], future_cols=[],
         target_col='y', forecasting_horizon=3, historic_input_sequence_length=10,
         number_of_epochs=2, batch_size=16, save_path=str(tmp_path), device=torch.device('cpu'),
@@ -48,7 +48,7 @@ def test_fit_predict_checkpoint_roundtrip(tmp_path, csv_path):
     assert np.all(np.isfinite(fc.loss_log))
     assert np.all(np.isfinite(fc.val_log['loss']))
 
-    preds = fc.predict(val_src)
+    preds = fc.predict(val_data)
     assert preds.ndim == 3 and preds.shape[-1] == 1
     assert np.all(np.isfinite(preds))
 
@@ -62,7 +62,7 @@ def test_fit_predict_checkpoint_roundtrip(tmp_path, csv_path):
         embeddings=[EmbeddingNetwork(name='landuse', variables=['landuse_code'], embedding_dim=4, historic=True, future=False)],
         resume=True, loss=MAE(), optimizer=AdamW(lr=0.01),
         model_regularizer=L1Regularizer(lambda_=0.001),
-        training_datasets=[train_src], validation_datasets=[val_src],
+        training_data=train_data, validation_data=val_data,
         number_of_epochs=3, save_path=str(tmp_path), name='e2e', device='cpu',
     )
     assert fc2._start_epoch == 2
@@ -76,12 +76,12 @@ def test_fit_predict_checkpoint_roundtrip(tmp_path, csv_path):
         embeddings=[EmbeddingNetwork(name='landuse', variables=['landuse_code'], embedding_dim=4, historic=True, future=False)],
         device='cpu',
     )
-    preds3 = fc3.predict(val_src)
+    preds3 = fc3.predict(val_data)
     assert preds3.shape == preds.shape
 
 
 def test_quantile_head_and_shared_embedding_and_rln(tmp_path, csv_path):
-    train_src = DataSource(csv=csv_path, start='2020-01-01', end='2020-12-31')
+    train_data = TimeSeriesData([DataSource(csv=csv_path, start='2020-01-01', end='2020-12-31')])
 
     elev = EmbeddingNetwork(name='elev_like', variables=['temp'], embedding_dim=2, historic=True, future=True)
     model = LSTMEncoderDecoder(hidden_size=8, num_layers=1, dropout_rate=0.0, encoder_downscale_layer_size=4)
@@ -90,27 +90,27 @@ def test_quantile_head_and_shared_embedding_and_rln(tmp_path, csv_path):
     fc = Forecaster(
         model=model, name='qtest', embeddings=[elev], loss=QuantileLoss(q=levels),
         validation_score=CRPS(), optimizer=AdamW(lr=0.01), model_regularizer=RLN(theta=-6.0),
-        training_datasets=[train_src], validation_datasets=[train_src],
+        training_data=train_data, validation_data=train_data,
         historic_cols=['temp'], future_cols=['temp_fcst', 'temp'],
         target_col='y', forecasting_horizon=3, historic_input_sequence_length=10,
         number_of_epochs=1, batch_size=16, save_path=str(tmp_path), device=torch.device('cpu'),
     )
     fc.fit()
-    preds = fc.predict(train_src)
+    preds = fc.predict(train_data)
     assert preds.shape[-1] == len(levels)
     assert np.all(preds[..., 0] <= preds[..., 1])
     assert np.all(preds[..., 1] <= preds[..., 2])
 
 
 def test_duplicate_embedding_names_raise(tmp_path, csv_path):
-    train_src = DataSource(csv=csv_path, start='2020-01-01', end='2020-12-31')
+    train_data = TimeSeriesData([DataSource(csv=csv_path, start='2020-01-01', end='2020-12-31')])
     net_a = EmbeddingNetwork(name='dup', variables=['temp'], embedding_dim=2, historic=True, future=False)
     net_b = EmbeddingNetwork(name='dup', variables=['precip'], embedding_dim=2, historic=True, future=False)
     model = LSTMHistoric(hidden_size=4, num_layers=1, dropout_rate=0.0)
     with pytest.raises(ValueError):
         Forecaster(
             model=model, name='dupfail', embeddings=[net_a, net_b], loss=MAE(),
-            training_datasets=[train_src], validation_datasets=[train_src],
+            training_data=train_data, validation_data=train_data,
             historic_cols=['temp', 'precip'], future_cols=[],
             target_col='y', forecasting_horizon=2, historic_input_sequence_length=5,
             number_of_epochs=1, save_path=str(tmp_path), device=torch.device('cpu'),

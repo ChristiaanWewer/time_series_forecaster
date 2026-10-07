@@ -1,7 +1,12 @@
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
 from src.data.datasource import DataSource
+
+if TYPE_CHECKING:
+    from src.data.timeseries_data import TimeSeriesData
 
 
 def _read_1d_df(source: DataSource) -> pd.DataFrame | None:
@@ -135,4 +140,75 @@ def compute_norm_stats(
 
     stats['binary_cols'] = binary_cols
 
+    return stats
+
+
+def column_stats(df: pd.DataFrame) -> dict[str, tuple[float, float, float, bool]]:
+    """Per-column (n, mean, M2, is_binary) over the non-NaN float64 values of one source,
+    exactly as compute_norm_stats computes them per source. Stored per source in a
+    TimeSeriesData (and in the bundle manifest), so statistics never need another pass."""
+    stats = {}
+    for col in df.columns:
+        vals = df[col].values.astype(np.float64)
+        vals = vals[~np.isnan(vals)]
+        if len(vals) == 0:
+            stats[str(col)] = (0.0, 0.0, 0.0, False)
+            continue
+        mean = float(vals.mean())
+        stats[str(col)] = (float(len(vals)), mean, float(((vals - mean) ** 2).sum()), _is_binary(vals))
+    return stats
+
+
+def _std(n: float, M2: float) -> float:
+    return max(float(np.sqrt(M2 / (n - 1))) if n >= 2 else 1.0, 1e-8)
+
+
+def norm_stats_from(
+    data: 'TimeSeriesData',
+    historic_cols: list[str],
+    future_cols: list[str],
+    target_col: str | None = 'y',
+) -> dict:
+    """compute_norm_stats without reading any data: merges the stored per-source column
+    statistics of `data` in source order with Chan's algorithm, giving the same keys
+    and bitwise the same values as compute_norm_stats on the same sources."""
+    all_cols = list(dict.fromkeys(historic_cols + future_cols))
+    accum = {c: (0.0, 0.0, 0.0) for c in all_cols}
+    target_accum = (0.0, 0.0, 0.0)
+    group_accum: dict[str, tuple[float, float, float]] = {}
+
+    binary_cols: set[str] = set()
+    for source in data.sources:
+        binary_cols.update(source.binary_cols)
+
+    for source, stats in zip(data.sources, data.column_stats):
+        for col in all_cols:
+            if col not in stats or stats[col][0] == 0:
+                continue
+            n_b, mean_b, M2_b, is_binary = stats[col]
+            if col in binary_cols or is_binary:
+                binary_cols.add(col)
+                continue
+            accum[col] = _merge_stats(*accum[col], n_b, mean_b, M2_b)
+
+        if target_col is not None and target_col in stats and stats[target_col][0] > 0:
+            n_b, mean_b, M2_b, _ = stats[target_col]
+            target_accum = _merge_stats(*target_accum, n_b, mean_b, M2_b)
+            key = source.group_key
+            group_accum[key] = _merge_stats(*group_accum.get(key, (0.0, 0.0, 0.0)), n_b, mean_b, M2_b)
+
+    def side(cols):
+        mean = [0.0 if c in binary_cols or accum[c][0] < 2 else accum[c][1] for c in cols]
+        std = [1.0 if c in binary_cols or accum[c][0] < 2 else _std(accum[c][0], accum[c][2]) for c in cols]
+        return np.array(mean, dtype=np.float32), np.array(std, dtype=np.float32)
+
+    stats = {}
+    if len(data):
+        stats['xh_mean'], stats['xh_std'] = side(historic_cols)
+        stats['xf_mean'], stats['xf_std'] = side(future_cols)
+        n, mean, M2 = target_accum
+        stats['target_mean'] = float(mean)
+        stats['target_std'] = _std(n, M2)
+        stats['group_target_std'] = {key: _std(n_g, M2_g) for key, (n_g, _, M2_g) in group_accum.items()}
+    stats['binary_cols'] = binary_cols
     return stats

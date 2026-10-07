@@ -2,14 +2,20 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.data.datasource import DataSource
-from src.data.normalization import _read_1d_df
+from src.data.timeseries_data import TimeSeriesData
+from src.data.windows import build_window_index
 
 
 class TimeSeriesDataset(Dataset):
+    """Turns a list of window indices into one batch of normalized tensors
+    (x_h, x_f, y, group_idx), reading rows from a TimeSeriesData. 'memory' gathers the
+    whole batch at once; 'disk' does the same gather with its reads sorted by position,
+    so the disk is read mostly forward. The output is bitwise identical to
+    TimeSeriesDatasetOld."""
+
     def __init__(
         self,
-        sources: list[DataSource],
+        data: TimeSeriesData,
         seq_len: int,
         horizon: int,
         historic_cols: list[str],
@@ -17,81 +23,87 @@ class TimeSeriesDataset(Dataset):
         norm_stats: dict,
         target_col: str | None = 'y',
         dtype: torch.dtype = torch.float32,
+        source_positions: list[int] | None = None,
     ):
-        self._sources = sources
+        """Resolve column positions, build the window index for `source_positions` (all
+        sources by default) and turn norm_stats into per-column mean/std vectors.
+        group_idx is the position within `source_positions`, so a single-source
+        validation view always has group_idx 0, as today."""
+        self.data = data
         self._seq_len = seq_len
         self._horizon = horizon
-        self._historic_cols = historic_cols
-        self._future_cols = future_cols
-        self._norm_stats = norm_stats
-        self._target_col = target_col
-        self._dtype = dtype
         self._window_len = seq_len + horizon
+        self._dtype = dtype
+        positions = np.arange(len(data)) if source_positions is None else np.asarray(source_positions)
+        self._starts = data.offsets[positions]
 
-        self._1d_data: list = []
+        historic_idx = data.column_indices(historic_cols)
+        future_idx = data.column_indices(future_cols)
+        target_idx = data.column_indices([target_col]) if target_col is not None else np.empty(0, np.int64)
+        self.window_index = build_window_index(data, positions, seq_len, horizon, historic_idx, future_idx)
 
-        self._index: list[tuple[int, int]] = []
+        # gather only the columns this run uses, then address them by local position
+        self._used_cols = np.array(list(dict.fromkeys([*historic_idx, *future_idx, *target_idx])), dtype=np.int64)
+        local = {c: i for i, c in enumerate(self._used_cols)}
+        self._h = np.array([local[c] for c in historic_idx], dtype=np.int64)
+        self._f = np.array([local[c] for c in future_idx], dtype=np.int64)
+        self._y = np.array([local[c] for c in target_idx], dtype=np.int64)
+        self._has_target = target_col is not None
 
-        for src_idx, source in enumerate(sources):
-            tab = self._load_1d(source)
-            self._1d_data.append(tab)
-            n_time = tab[3]
-
-            for t in range(n_time - self._window_len + 1):
-                all_hist, all_fut, _, _ = tab
-                if all_hist.shape[1] > 0 and np.isnan(all_hist[t:t + seq_len]).any():
-                    continue
-                if all_fut.shape[1] > 0 and np.isnan(all_fut[t + seq_len:t + seq_len + horizon]).any():
-                    continue
-                self._index.append((src_idx, t))
-
-    def _load_1d(self, source: DataSource):
-        df = _read_1d_df(source)
-        if df is None:
-            return None
-        all_hist = (
-            df[self._historic_cols].values.astype(np.float32)
-            if self._historic_cols else np.empty((len(df), 0), dtype=np.float32)
-        )
-        all_fut = (
-            df[self._future_cols].values.astype(np.float32)
-            if self._future_cols else np.empty((len(df), 0), dtype=np.float32)
-        )
-        all_y = (
-            df[[self._target_col]].values.astype(np.float32)
-            if self._target_col is not None else None
-        )
-        return all_hist, all_fut, all_y, len(df)
+        ns = norm_stats
+        self._xh_norm = (ns['xh_mean'], ns['xh_std']) if historic_cols and 'xh_mean' in ns else None
+        self._xf_norm = (ns['xf_mean'], ns['xf_std']) if future_cols and 'xf_mean' in ns else None
+        self._y_norm = (ns['target_mean'], ns['target_std']) if 'target_mean' in ns else None
 
     def __len__(self) -> int:
-        return len(self._index)
+        """The number of valid windows."""
+        return len(self.window_index)
 
     def __getitem__(self, i: int) -> dict:
-        src_idx, t = self._index[i]
-        ns = self._norm_stats
-        all_hist, all_fut, all_y, _ = self._1d_data[src_idx]
+        """One sample, through the batched path with a batch of one. Kept for debugging
+        and for the test that proves DataLoader uses __getitems__."""
+        return {k: v[0] for k, v in self.__getitems__([i]).items()}
 
-        xh = all_hist[t:t + self._seq_len].copy()
-        xf = all_fut[t + self._seq_len:t + self._seq_len + self._horizon].copy()
+    def __getitems__(self, indices: list[int]) -> dict:
+        """A whole batch in one call. PyTorch's DataLoader uses this hook instead of
+        calling __getitem__ once per sample; requires an identity collate_fn."""
+        windows = self.window_index[np.asarray(indices, dtype=np.int64)]
+        return self._assemble(self._gather(windows), windows[:, 0])
 
-        binary_cols = ns.get('binary_cols', set())
-        if self._historic_cols and 'xh_mean' in ns:
-            for col_idx, col in enumerate(self._historic_cols):
-                if col not in binary_cols:
-                    xh[:, col_idx] = (xh[:, col_idx] - ns['xh_mean'][col_idx]) / ns['xh_std'][col_idx]
-        if self._future_cols and 'xf_mean' in ns:
-            for col_idx, col in enumerate(self._future_cols):
-                if col not in binary_cols:
-                    xf[:, col_idx] = (xf[:, col_idx] - ns['xf_mean'][col_idx]) / ns['xf_std'][col_idx]
+    def _gather(self, windows: np.ndarray) -> np.ndarray:
+        """Raw rows of the given windows as (batch, seq_len + horizon, n_cols), in one fancy
+        index over data.rows. In 'disk' mode the reads are sorted first and the result is
+        put back in the requested order, so sorting is invisible to the caller."""
+        starts = self._starts[windows[:, 0]] + windows[:, 1]
+        offsets = np.arange(self._window_len)
+        if self.data.mode != 'disk':
+            return self.data.rows[(starts[:, None] + offsets)[:, :, None], self._used_cols]
+        order = np.argsort(starts, kind='stable')
+        raw_sorted = self.data.rows[(starts[order][:, None] + offsets)[:, :, None], self._used_cols]
+        raw = np.empty_like(raw_sorted)
+        raw[order] = raw_sorted
+        return raw
+
+    def _assemble(self, raw: np.ndarray, group_idx: np.ndarray) -> dict:
+        """Split raw windows into x_h, x_f and y, normalize them as whole-array arithmetic
+        (binary columns have mean 0 and std 1, so they pass through unchanged), and
+        convert them to tensors."""
+        s = self._seq_len
+        xh = raw[:, :s, self._h]
+        xf = raw[:, s:, self._f]
+        if self._xh_norm is not None:
+            xh = (xh - self._xh_norm[0]) / self._xh_norm[1]
+        if self._xf_norm is not None:
+            xf = (xf - self._xf_norm[0]) / self._xf_norm[1]
 
         result = {
-            'x_h': torch.tensor(xh, dtype=self._dtype),
-            'x_f': torch.tensor(xf, dtype=self._dtype),
-            'group_idx': torch.tensor(src_idx, dtype=torch.long),
+            'x_h': torch.from_numpy(xh).to(self._dtype),
+            'x_f': torch.from_numpy(xf).to(self._dtype),
+            'group_idx': torch.from_numpy(group_idx.astype(np.int64)),
         }
-        if all_y is not None:
-            y = all_y[t + self._seq_len:t + self._seq_len + self._horizon].copy()
-            if 'target_mean' in ns:
-                y = (y - ns['target_mean']) / ns['target_std']
-            result['y'] = torch.tensor(y, dtype=self._dtype)
+        if self._has_target:
+            y = raw[:, s:, self._y]
+            if self._y_norm is not None:
+                y = (y - self._y_norm[0]) / self._y_norm[1]
+            result['y'] = torch.from_numpy(y).to(self._dtype)
         return result

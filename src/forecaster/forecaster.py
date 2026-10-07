@@ -6,16 +6,34 @@ from numpy.lib import recfunctions as rfn
 import torch
 from torch.utils.data import DataLoader
 
-from src.data.datasource import DataSource
-from src.data.normalization import compute_norm_stats
+from src.data.normalization import norm_stats_from
+from src.data.timeseries_data import TimeSeriesData
 from src.data.timeseries_dataset import TimeSeriesDataset
+from src.forecaster.prefetcher import _make_prefetcher
 from src.optim import Adam
 from src.utils.scores_and_losses import MAE, assert_differentiable
 
 
-def _collate_fn(batch: list[dict]) -> dict:
-    common_keys = set.intersection(*[set(item.keys()) for item in batch])
-    return {k: torch.stack([item[k] for item in batch]) for k in sorted(common_keys)}
+def _identity_collate(batch: dict) -> dict:
+    """collate_fn for TimeSeriesDataset: __getitems__ already returns an assembled batch.
+    A module-level function rather than a lambda, so it pickles into spawned workers."""
+    return batch
+
+
+def _make_loader(dataset, batch_size, shuffle, device, num_workers=0, pin_memory=True,
+                 drop_last=False, prefetch_factor=2, persistent_workers=True) -> DataLoader:
+    """One DataLoader configured the same way at every site (training, validation,
+    predict): identity collate, pinned memory when the device is CUDA, and persistent
+    workers when num_workers > 0."""
+    kwargs = dict(
+        batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+        collate_fn=_identity_collate,
+        pin_memory=pin_memory and torch.device(device).type == 'cuda',
+    )
+    if num_workers > 0:
+        kwargs.update(num_workers=num_workers, prefetch_factor=prefetch_factor,
+                      persistent_workers=persistent_workers)
+    return DataLoader(dataset, **kwargs)
 
 
 def _criteria_field_names(criteria: list) -> list[str]:
@@ -37,8 +55,8 @@ class Forecaster:
             self,
             model,
             name,
-            training_datasets: list[DataSource],
-            validation_datasets: list[DataSource],
+            training_data: TimeSeriesData,
+            validation_data: TimeSeriesData | None,
             loss,
             embeddings: list | None = None,
             validation_score=None,
@@ -57,8 +75,9 @@ class Forecaster:
             number_of_epochs=100,
             batch_size=512,
             num_workers=0,
+            validation_num_workers=0,
             prefetch_factor=2,
-            pin_memory=False,
+            pin_memory=True,
             drop_last=False,
             shuffle=True,
             dtype=torch.float32,
@@ -118,8 +137,8 @@ class Forecaster:
         # val. Pass norm_stats explicitly (e.g. when resuming) to reuse the exact prior
         # stats instead of recomputing them.
         if norm_stats is None:
-            norm_stats = compute_norm_stats(
-                sources=training_datasets,
+            norm_stats = norm_stats_from(
+                training_data,
                 historic_cols=historic_cols,
                 future_cols=future_cols,
                 target_col=target_col,
@@ -130,14 +149,14 @@ class Forecaster:
 
         # group-reweighted losses (reweight=True) need each training source's own raw
         # target std, looked up by its stable identity (DataSource.group_key) rather
-        # than list position, so a resumed run with reordered training_datasets still
+        # than list position, so a resumed run with reordered training_data sources still
         # lines samples up with the right series — a missing key here means a series
         # present now wasn't present when norm_stats was computed, deliberately
         # uncaught.
         if getattr(loss, 'needs_group_idx', False):
             group_target_std = norm_stats['group_target_std']
             group_std = torch.tensor(
-                [group_target_std[ds.group_key] for ds in training_datasets], dtype=dtype
+                [group_target_std[ds.group_key] for ds in training_data.sources], dtype=dtype
             )
             loss.bind(group_std)
             loss.to(self.device)
@@ -152,24 +171,24 @@ class Forecaster:
             target_col=target_col,
             dtype=dtype,
         )
-        training_dataset = TimeSeriesDataset(sources=training_datasets, **_ds_kwargs)
-        val_datasets = [TimeSeriesDataset(sources=[src], **_ds_kwargs) for src in validation_datasets]
+        training_dataset = TimeSeriesDataset(training_data, **_ds_kwargs)
+        # one dataset per validation source over the shared TimeSeriesData, so metrics
+        # stay per series (one val_log row each)
+        val_datasets = [
+            TimeSeriesDataset(validation_data, source_positions=[i], **_ds_kwargs)
+            for i in range(len(validation_data))
+        ] if validation_data is not None else []
 
-        # DataLoader settings
-        _loader_kwargs = dict(
-            collate_fn=_collate_fn,
-            pin_memory=pin_memory,
-            drop_last=drop_last,
-        )
-        if num_workers > 0:
-            _loader_kwargs['num_workers'] = num_workers
-            _loader_kwargs['prefetch_factor'] = prefetch_factor
-
-        self.training_loader = DataLoader(
-            training_dataset, batch_size=batch_size, shuffle=shuffle, **_loader_kwargs
+        # validation workers are a separate knob without persistent workers: with N
+        # validation loaders, persistent pools would keep N × workers processes alive
+        _loader_kwargs = dict(device=device, pin_memory=pin_memory, drop_last=drop_last,
+                              prefetch_factor=prefetch_factor)
+        self.training_loader = _make_loader(
+            training_dataset, batch_size, shuffle=shuffle, num_workers=num_workers, **_loader_kwargs
         )
         self.validation_loaders = [
-            DataLoader(ds, batch_size=batch_size, shuffle=False, **_loader_kwargs)
+            _make_loader(ds, batch_size, shuffle=False, num_workers=validation_num_workers,
+                         persistent_workers=False, **_loader_kwargs)
             for ds in val_datasets
         ]
 
@@ -391,12 +410,12 @@ class Forecaster:
             optimizer=None,
             embedding_regularization=None,
             model_regularizer=None,
-            training_datasets: list[DataSource] | None = None,
-            validation_datasets: list[DataSource] | None = None,
+            training_data: TimeSeriesData | None = None,
+            validation_data: TimeSeriesData | None = None,
             device='cpu',
             batch_size=512,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=True,
             use_torch_compile=False,
             learning_rate=None,
             **forecaster_kwargs,
@@ -408,25 +427,25 @@ class Forecaster:
         the same unbound objects you'd hand to a fresh Forecaster() call.
 
         Three modes:
-        - training_datasets=None: inference only. Binds model/embeddings using the
+        - training_data=None: inference only. Binds model/embeddings using the
           schema and output shape saved in the checkpoint, then loads weights. No
           optimizer, loaders, or regularizers.
-        - resume=True (requires training_datasets and every other component):
+        - resume=True (requires training_data and every other component):
           continues the same run — a full Forecaster() construction, then weights,
           optimizer state, regularizer state, and log history are loaded on top from
           the checkpoint. `learning_rate`, if given, overwrites just the restored
           optimizer's LR (keeps momentum/Adam moment state).
-        - resume=False + training_datasets given: a fresh run warm-started from these
+        - resume=False + training_data given: a fresh run warm-started from these
           weights as an initialization — fresh optimizer, fresh norm_stats, fresh
           logs at epoch 0; only weights are loaded.
         """
-        if resume and training_datasets is None:
-            raise ValueError("resume=True requires training_datasets to continue training.")
+        if resume and training_data is None:
+            raise ValueError("resume=True requires training_data to continue training.")
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         embeddings = embeddings or []
 
-        if training_datasets is None:
+        if training_data is None:
             fc = cls.__new__(cls)
             fc.device = device
             fc.historic_cols = ckpt['historic_cols']
@@ -468,7 +487,7 @@ class Forecaster:
                 validation_logging_criteria=validation_logging_criteria,
                 optimizer=optimizer, embedding_regularization=embedding_regularization,
                 model_regularizer=model_regularizer,
-                training_datasets=training_datasets, validation_datasets=validation_datasets or [],
+                training_data=training_data, validation_data=validation_data,
                 historic_cols=ckpt['historic_cols'], future_cols=ckpt['future_cols'],
                 target_col=ckpt['target_col'], forecasting_horizon=ckpt['forecasting_horizon'],
                 historic_input_sequence_length=ckpt['historic_input_sequence_length'],
@@ -505,7 +524,7 @@ class Forecaster:
                 validation_logging_criteria=validation_logging_criteria,
                 optimizer=optimizer, embedding_regularization=embedding_regularization,
                 model_regularizer=model_regularizer,
-                training_datasets=training_datasets, validation_datasets=validation_datasets or [],
+                training_data=training_data, validation_data=validation_data,
                 device=device, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
                 use_torch_compile=False,
                 **forecaster_kwargs,
@@ -539,15 +558,15 @@ class Forecaster:
             net.train()
         loss = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         n = 0
-        for batch in self.training_loader:
-            y = batch['y'].to(self.device)
+        for batch in _make_prefetcher(self.training_loader, self.device):
+            y = batch['y']
             valid = ~y.isnan().any(dim=(1, 2))
             if not valid.any():
                 continue
-            x_h = batch['x_h'].to(self.device)[valid]
-            x_f = batch['x_f'].to(self.device)[valid]
+            x_h = batch['x_h'][valid]
+            x_f = batch['x_f'][valid]
             x_h, x_f = self._embed(x_h, x_f)
-            group_idx = batch['group_idx'].to(self.device)[valid] if 'group_idx' in batch else None
+            group_idx = batch['group_idx'][valid] if 'group_idx' in batch else None
             loss += self.__training_step(x_h, x_f, y[valid], group_idx)
             n += 1
         self.loss_log[epoch] = (loss / n).cpu().item() if n else 0.0
@@ -563,13 +582,13 @@ class Forecaster:
             log = torch.zeros(self.N_criteria, device=self.device, dtype=self.dtype)
             accs = [m.new_accumulators() if p else None for m, p in zip(metrics, poolable)]
             n = 0
-            for batch in loader:
-                y = batch['y'].to(self.device)
+            for batch in _make_prefetcher(loader, self.device):
+                y = batch['y']
                 valid = ~y.isnan().any(dim=(1, 2))
                 if not valid.any():
                     continue
-                x_h = batch['x_h'].to(self.device)[valid]
-                x_f = batch['x_f'].to(self.device)[valid]
+                x_h = batch['x_h'][valid]
+                x_f = batch['x_f'][valid]
                 x_h, x_f = self._embed(x_h, x_f)
                 y_valid = y[valid]
                 y_pred = self._model_forward(x_h, x_f)
@@ -624,7 +643,7 @@ class Forecaster:
                 f'  best={self.best_logged_criterion:.4f}'
             )
 
-    def predict(self, x_test: DataSource | list[DataSource], batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=False, epoch=None):
+    def predict(self, x_test: TimeSeriesData, batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=True, epoch=None):
         batch_size = batch_size or self.batch_size
         device = device or self.device
         if device != self.device:
@@ -640,10 +659,8 @@ class Forecaster:
             # checkpoint file itself) may not exist — deliberately uncaught, let it crash.
             self.load_weights(path=self.save_path_epoch.format(epoch=epoch))
 
-        if isinstance(x_test, DataSource):
-            x_test = [x_test]
         dataset = TimeSeriesDataset(
-            sources=x_test,
+            x_test,
             seq_len=self.historic_input_sequence_length,
             horizon=self.forecasting_horizon,
             historic_cols=self.historic_cols,
@@ -653,20 +670,16 @@ class Forecaster:
             dtype=self.dtype,
         )
 
-        _loader_kwargs = dict(collate_fn=_collate_fn, pin_memory=pin_memory)
-        if num_workers > 0:
-            _loader_kwargs['num_workers'] = num_workers
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, **_loader_kwargs)
+        loader = _make_loader(dataset, batch_size, shuffle=False, device=device, num_workers=num_workers,
+                              pin_memory=pin_memory, persistent_workers=False)
 
         self.model.eval()
         for net in self.embeddings:
             net.eval()
         preds = []
         with torch.no_grad():
-            for batch in loader:
-                x_h = batch['x_h'].to(device)
-                x_f = batch['x_f'].to(device)
-                x_h, x_f = self._embed(x_h, x_f)
+            for batch in _make_prefetcher(loader, device):
+                x_h, x_f = self._embed(batch['x_h'], batch['x_f'])
                 preds.append(self._model_forward(x_h, x_f))
         preds = torch.cat(preds, dim=0)
         if denormalize:

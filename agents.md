@@ -9,12 +9,17 @@ Dependency management is `uv`-based (`pyproject.toml` + `uv.lock`, dev tools lik
 ```
 src/
   data/
-    __init__.py              — exports DataSource
+    __init__.py              — exports DataSource, TimeSeriesData
     datasource.py             — DataSource dataclass
-    timeseries_dataset.py     — TimeSeriesDataset + _collate_fn
-    normalization.py          — compute_norm_stats, _read_1d_df helper
+    timeseries_data.py        — TimeSeriesData: sources prepared up front, mode='memory' | 'disk'
+    bundle.py                 — on-disk bundle format for mode='disk' (corpus.npy + manifest.json)
+    windows.py                — build_window_index: valid (NaN-free) windows as an int64 array
+    timeseries_dataset.py     — TimeSeriesDataset: batched window assembly (__getitems__)
+    timeseries_dataset_old.py — TimeSeriesDatasetOld: previous implementation, kept as the equivalence reference
+    normalization.py          — column_stats, norm_stats_from, compute_norm_stats (reference), _read_1d_df helper
   forecaster/
     forecaster.py              — training loop, embeddings/model binding, logging, checkpointing
+    prefetcher.py              — _CudaPrefetcher / _make_prefetcher: overlaps host→GPU copies with compute
   models/
     base.py                    — BaseForecastModel (settings-then-bind scaffolding shared by every backbone)
     embeddings.py               — EmbeddingNetwork (settings-then-bind per-group embedding, owned by Forecaster)
@@ -31,8 +36,10 @@ src/
       loss_utils.py                — Numba softmin/Hessian-product helpers used by path_soft_dtw.py
       dilate_loss.py                — DILATE loss combining shape + temporal terms
       __init__.py
-tests/                             — pytest suite (test_embeddings.py, test_models.py,
-                                      test_optim_regularization.py, test_forecaster_end_to_end.py)
+tests/                             — pytest suite (test_dilate.py, test_embeddings.py, test_models.py,
+                                      test_optim_regularization.py, test_forecaster_end_to_end.py,
+                                      test_scores_and_losses.py, test_scores_and_losses_probabilistic.py,
+                                      test_timeseries_data.py)
 ```
 
 ---
@@ -68,7 +75,9 @@ Validation in `__post_init__`: at least one of `csv`/`netcdf_1d` required; `netc
 
 No `target_col` field — that's owned by `Forecaster` now (see below), not per-source. For a netcdf source, note that `netcdf_1d_vars` must include the target variable's name too if it's meant to be read from that file for training — `_read_1d_df` subsets the netcdf dataset down to exactly `netcdf_1d_vars` before the target lookup ever happens, unlike the CSV path which reads every column unconditionally.
 
-**`group_key` property** — `self.name or self.csv or self.netcdf_1d`. The identity used to key `compute_norm_stats`' `group_target_std` and `Forecaster`'s per-series lookup for group-reweighted losses (see both below). Falling back to the already-required file path when `name` is unset means multiple `DataSource` entries for the same underlying series (e.g. separate train/val date-range windows on the same file) share one key without needing `name` set explicitly, and existing single-series usage is unaffected. Deliberately *not* keyed by list position — a checkpoint resume that passes `training_datasets` in a different order still lines samples up with the right series.
+**`group_key` property** — `self.name or self.csv or self.netcdf_1d`. The identity used to key `compute_norm_stats`' `group_target_std` and `Forecaster`'s per-series lookup for group-reweighted losses (see both below). Falling back to the already-required file path when `name` is unset means multiple `DataSource` entries for the same underlying series (e.g. separate train/val date-range windows on the same file) share one key without needing `name` set explicitly, and existing single-series usage is unaffected. Deliberately *not* keyed by list position — a checkpoint resume that passes the training sources in a different order still lines samples up with the right series.
+
+`group_key` answers "which physical series is this" and is shared by date ranges of one series. It is **not** used to find rows in a bundle — that is `bundle.bundle_key`, which covers every field that changes the rows read (files, `netcdf_1d_vars`, `csv_index_col`, `start`, `end`, `nodata_values`), so two date ranges of one series are separate bundle entries.
 
 ---
 
@@ -80,7 +89,11 @@ No `target_col` field — that's owned by `Forecaster` now (see below), not per-
 
 **`compute_norm_stats(sources, historic_cols, future_cols, target_col='y')`** — computes per-variable mean/std using Chan's algorithm: iterates one source at a time, accumulating `(n, mean, M2)` per column, never holding more than one source's data in memory. Target stats are accumulated in the same pass, using `target_col` (not read off `DataSource` — see `Forecaster` below); if `target_col` is `None` or absent from a source's columns, target stats are skipped for that source. Alongside the single pooled `target_accum` (across every source), a second `group_accum: dict[group_key, (n, mean, M2)]` is merged per `source.group_key` in the same loop iteration — same `_merge_stats` call, just keyed by series identity instead of pooled into one bucket, so multiple sources sharing a `group_key` (e.g. separate date-range windows of the same series) correctly combine into one entry.
 
-Called on **training sources only**. The resulting stats are then applied to both training and validation datasets.
+Called on **training sources only**. The resulting stats are then applied to both training and validation datasets. `Forecaster` no longer calls it — it is kept as the reference `norm_stats_from` is tested against.
+
+**`column_stats(df)`** — per-column `(n, mean, M2, is_binary)` over the non-NaN float64 values of one source, computed exactly as `compute_norm_stats` does per source. `TimeSeriesData` stores one dict per source (and the bundle manifest persists them).
+
+**`norm_stats_from(data, historic_cols, future_cols, target_col='y')`** — what `Forecaster` uses. Produces the same keys and bitwise the same values as `compute_norm_stats` on the same sources, but reads no data: it merges the stored per-source `column_stats` of a `TimeSeriesData` in source order with `_merge_stats`, replicating `compute_norm_stats`' binary-column and target/group logic.
 
 Binary column handling: a column is skipped (mean=0, std=1) if it appears in `source.binary_cols` OR if auto-detection finds all values in `{0, 1}`. Skipped columns are recorded in `stats['binary_cols']`.
 
@@ -93,30 +106,47 @@ Returns a dict with keys:
 
 ---
 
+## `src/data/timeseries_data.py` — `TimeSeriesData`
+
+The user-facing collection of `DataSource`s, prepared up front: `TimeSeriesData(sources, mode='memory' | 'disk', path=None)`. All expensive data work happens in this constructor, in the user's own line of code; `Forecaster` and `predict()` only accept `TimeSeriesData`.
+
+- **`mode='memory'`** (default) — parses every source (`_parse_source`: `_read_1d_df`, numeric columns only, cast to float32, plus `column_stats`) and concatenates them into one resident array. `path` must be `None`.
+- **`mode='disk'`** (`path` required) — `_prepare_disk`: if `path` holds a bundle, it is reused when it contains every source (matched by `bundle_key`, never by position; a superset is fine) and no source file's size/mtime changed; if `path` is empty, `_compile_bundle` builds one holding at most one source in RAM (pass 1 parses each source into a temp file, pass 2 copies them into `corpus.npy`; `manifest.json` is written last so an interrupted compile never looks valid). Anything else raises `ValueError` — never a silent rebuild or overwrite.
+
+Both modes expose the same flat row space: `rows` (`(total_rows, n_cols)` float32 — the array, or a memory map opened lazily per process), `columns` (union of all numeric columns, NaN where a source lacks one), and per source in the user's list order `offsets`, `n_rows`, `column_stats`. NaNs are never removed — rows keep their true time step; windows decide what is usable. `column_indices(cols)` raises `KeyError` if a column is missing from any source. `__getstate__` drops the memory map so DataLoader workers reopen it instead of receiving a copy of the data.
+
+## `src/data/bundle.py`
+
+`bundle_key(source)` (see `DataSource.group_key` above), `file_fingerprint(source)` (`{resolved path: [size, mtime_ns]}`), and `BundleManifest(columns, entries)` with `save`/`load`/`resolve(sources)`. Each entry holds `key`, `start`, `n_rows`, `fingerprint`, `column_stats`. Compression is deliberately absent: uncompressed `.npy` lets a window read exactly its rows.
+
+## `src/data/windows.py`
+
+**`build_window_index(data, source_positions, seq_len, horizon, historic_idx, future_idx)`** — int64 array `(n_windows, 2)` of (position within `source_positions`, start row within that source), ordered by source then start — the same order `TimeSeriesDatasetOld._index` had. A window is kept when its historic span is NaN-free in the historic columns and its future span NaN-free in the future columns (vectorized with a cumulative NaN count per source). Targets are not checked; NaN targets are masked per batch in the training loop. Starts always satisfy `start + seq_len + horizon <= n_rows` (asserted), so a window can never straddle into the next source of the flat row space.
+
 ## `src/data/timeseries_dataset.py` — `TimeSeriesDataset`
 
-Lazy `torch.utils.data.Dataset`. Pre-loads 1D data into memory. Always returns *raw, unembedded* `x_h`/`x_f` — embedding is entirely a `Forecaster`-level concern now (see below), so this class is unaffected by whether any embeddings are configured.
+`torch.utils.data.Dataset` over a `TimeSeriesData`. Always returns *raw, unembedded* `x_h`/`x_f` — embedding is entirely a `Forecaster`-level concern.
 
-**Constructor** — `sources, seq_len, horizon, historic_cols, future_cols, norm_stats, target_col='y', dtype`
+**Constructor** — `data, seq_len, horizon, historic_cols, future_cols, norm_stats, target_col='y', dtype, source_positions=None`. Builds `self.window_index` for `source_positions` (all sources by default).
 
-At construction:
-1. Loads 1D DataFrames into memory per source.
-2. Builds a flat index `[(source_idx, t)]` of all valid windows, skipping any window with NaN in `x_h`/`x_f`.
+**`__getitems__(indices)`** — the batched-fetch hook PyTorch's DataLoader calls instead of `__getitem__` per sample. One fancy index over `data.rows` gathers the whole batch (only the columns this run uses); in `'disk'` mode reads are sorted by row first and the result restored to the requested order. Normalization is whole-array arithmetic — binary columns have mean 0/std 1 in `norm_stats`, so they pass through unchanged. Output is bitwise identical to `TimeSeriesDatasetOld` (tested). **Requires an identity `collate_fn`** — PyTorch still passes the hook's return value through `collate_fn`; `forecaster._identity_collate` is that function (module-level, so it pickles into workers). `__getitem__(i)` goes through the same path with a batch of one.
 
-**`__getitem__(i)`** — returns a `dict`:
+Batch dict:
 
 | Key | Shape | Condition |
 |---|---|---|
-| `x_h` | `(seq_len, n_hist)` | always |
-| `x_f` | `(horizon, n_fut)` | always |
-| `group_idx` | scalar, `long` | always — the sample's position (`source_idx`) in the `sources` list this `TimeSeriesDataset` was built from |
-| `y` | `(horizon, 1)` | only if `target_col is not None` |
+| `x_h` | `(B, seq_len, n_hist)` | always |
+| `x_f` | `(B, horizon, n_fut)` | always |
+| `group_idx` | `(B,)`, `long` | always — the sample's position within `source_positions` |
+| `y` | `(B, horizon, 1)` | only if `target_col is not None` |
 
-All values are normalized using `norm_stats`. `y` NaN values are preserved for loss masking. `target_col=None` is how `Forecaster.predict` builds its dataset — no target column needed on a file used purely for inference. `_load_1d` looks up `df[[target_col]]` with no existence guard, so a wrong or missing column name raises a plain `KeyError` rather than a custom error.
+`group_idx` is meaningful only *within* one dataset: for training it is the position in `training_data.sources`, which is also the order `Forecaster` binds `group_std` in. Validation datasets are single-source views (`source_positions=[i]`), so their `group_idx` is always `0` and unused. It is not persisted — `Forecaster` re-derives `group_std` every run by looking up each training source's `group_key` in `norm_stats['group_target_std']`.
 
-`group_idx` is unconditional (present even when `reweight` is never used — harmless extra key `Forecaster` excludes before the model sees anything) and is meaningful only *within* one `TimeSeriesDataset`/`Forecaster` instance: since `Forecaster` always builds `TimeSeriesDataset(sources=training_datasets, ...)` from the exact same list it holds, position *i* here matches `training_datasets[i]` for that run. It is not itself persisted across checkpoint resumes — `Forecaster` re-derives the array group-reweighted losses actually bind against fresh, every run, by looking up each of *this* run's `training_datasets` by their stable `group_key` (see `DataSource.group_key` above) in the checkpoint's saved `group_target_std`, so a reordered `training_datasets` on resume still lines up correctly.
+`TimeSeriesDatasetOld` (`timeseries_dataset_old.py`) is the previous per-sample implementation, kept only as the equivalence reference in `tests/test_timeseries_data.py`.
 
-**`_collate_fn(batch)`** — custom collate that stacks tensors for the intersection of keys across all items in the batch. Import from `src.data.timeseries_dataset`.
+## `src/forecaster/prefetcher.py`
+
+**`_make_prefetcher(loader, device)`** — the only entry point `Forecaster` uses in training, validation and `predict`. On CUDA with a pinned loader it returns `_CudaPrefetcher`, which copies batch n+1 on a side stream while batch n computes (wait → take batch → `record_stream` → preload next; the order matters). Otherwise it is a plain generator moving each batch to the device. Both yield dicts of on-device tensors.
 
 ---
 
@@ -273,7 +303,7 @@ Ported from `marcdemers/batch-DILATE` (a batched fork of the original `vincent-l
 
 ## `src/forecaster/forecaster.py` — `Forecaster`
 
-Training orchestrator, and the single place every settings-then-bind component actually gets bound. Takes `DataSource` lists, an unbound model, a list of unbound embeddings, a real loss/score/criteria, and settings-only optimizer/regularizer objects; handles normalization, binding, training, validation, checkpointing, and inference.
+Training orchestrator, and the single place every settings-then-bind component actually gets bound. Takes `TimeSeriesData` objects (`training_data`, `validation_data`, which may be `None`), an unbound model, a list of unbound embeddings, a real loss/score/criteria, and settings-only optimizer/regularizer objects; handles normalization, binding, training, validation, checkpointing, and inference.
 
 **Key constructor parameters:**
 
@@ -285,18 +315,19 @@ Training orchestrator, and the single place every settings-then-bind component a
 | `optimizer` | A settings object from `src/optim.py` (`AdamW(lr=0.001, weight_decay=0.01)`), default `Adam(lr=0.001)` if not given. `self.learning_rate` is read off it (`optimizer.lr`) — there's no separate `learning_rate=` argument. |
 | `embedding_regularization`, `model_regularizer` | Two independent regularizer slots (`L1Regularizer`/`L2Regularizer`/`RLN` instances, or `None`) — see `regularization.py` above. |
 | `target_col` | `str \| None`, default `'y'` — column name for the target across all sources. Lives here, not on `DataSource` (one Forecaster = one target). Saved/restored in the checkpoint. |
-| `num_workers` | DataLoader worker processes (default `0`) |
+| `num_workers` | Training DataLoader worker processes (default `0`; persistent when `> 0`). Use `0` with `mode='memory'` (no I/O to hide, worker IPC is pure cost) and `> 0` with `mode='disk'` (workers absorb page faults). |
+| `validation_num_workers` | Workers per validation loader (default `0`, never persistent) — there is one loader per validation source, so persistent pools would keep N × workers processes alive |
 | `prefetch_factor` | Prefetch factor; applied only when `num_workers > 0` (default `2`) |
-| `pin_memory` | DataLoader pin memory (default `False`) |
+| `pin_memory` | Pin batches in host memory (default `True`); only applied on a CUDA device, where the prefetcher needs it for asynchronous copies |
 | `drop_last` | Drop last incomplete batch (default `False`) |
 | `shuffle` | Shuffle training loader; validation always `False` (default `True`) |
-| `norm_stats` | `dict \| None` — reuse pre-computed stats instead of calling `compute_norm_stats` (used internally by `load_model` on resume, so datasets stay consistent with what the restored model/optimizer were trained against) |
+| `norm_stats` | `dict \| None` — reuse pre-computed stats instead of calling `norm_stats_from` (used internally by `load_model` on resume, so datasets stay consistent with what the restored model/optimizer were trained against) |
 
 **Init flow (`__init__`):**
 1. `assert_differentiable(loss)`; read `output_kind`/`output_levels`/`n_outputs = getattr(loss, ..., default)` off the resolved `loss` object — plain losses like `MAE()` are unaffected (`output_kind='point'`, `n_outputs=1`).
-2. `compute_norm_stats(training sources only)` → `norm_stats`, unless passed in directly.
-3. Group-reweighted loss wiring — if `getattr(loss, 'needs_group_idx', False)`: builds `group_std` from `norm_stats['group_target_std']` keyed by each `training_datasets` entry's `group_key`, in list order (matching `TimeSeriesDataset`'s `group_idx` assignment); `loss.bind(group_std)`.
-4. `TimeSeriesDataset(training_datasets, ...)` → training dataset; one per validation source → validation datasets; wrapped in `DataLoader`s.
+2. `norm_stats_from(training_data)` → `norm_stats` (no data read), unless passed in directly.
+3. Group-reweighted loss wiring — if `getattr(loss, 'needs_group_idx', False)`: builds `group_std` from `norm_stats['group_target_std']` keyed by each `training_data.sources` entry's `group_key`, in list order (matching `TimeSeriesDataset`'s `group_idx` assignment); `loss.bind(group_std)`.
+4. `TimeSeriesDataset(training_data, ...)` → training dataset; `TimeSeriesDataset(validation_data, source_positions=[i], ...)` per validation source (one `val_log` row each); all wrapped by `_make_loader` (identity collate, pinning on CUDA, persistent training workers). The loops iterate `_make_prefetcher(loader, device)`, so batches arrive on the device.
 5. Every entry in `embeddings` gets `.bind(historic_cols, future_cols)` called (raises `ValueError` first if any two share a `name`).
 6. `Forecaster` combines the bound embeddings into its own historic/future feature pipeline: for each side, `_prepare_side(embeddings, cols, idx_attr)` collects the nets applicable to that side plus the passthrough column indices (columns claimed by no embedding), and computes the resulting feature width (`sum(embedding_dim) + len(passthrough)`). `_embed(x_h, x_f)` — called on every batch, in training/eval/predict — slices, applies each net, and concatenates with passthrough at call time (`_embed_side`). This logic lives directly in `Forecaster`, not as an exported class.
 7. `model.bind(historic_input_size=..., future_input_size=..., forecasting_horizon=..., n_outputs=..., output_kind=..., output_levels=...)` — the model's real layers get built now.
@@ -333,15 +364,15 @@ Training orchestrator, and the single place every settings-then-bind component a
 
 The model's backbone/head split is done by filtering `model.state_dict()` on the `output_head.` name prefix — no separate submodule needed. Checkpoints hold **learned state only** — no reconstructable hyperparameters, no spec strings of any kind. `load_weights(path=None)` reloads just `ckpt['model']`/`ckpt['embeddings']` into the current in-memory `Forecaster` (same process, e.g. reverting to the best epoch after training).
 
-**`Forecaster.load_model(checkpoint_path, model, embeddings=None, resume=False, loss=None, validation_score=None, validation_logging_criteria=None, optimizer=None, embedding_regularization=None, model_regularizer=None, training_datasets=None, validation_datasets=None, device='cpu', batch_size=512, num_workers=0, pin_memory=False, use_torch_compile=False, learning_rate=None, **forecaster_kwargs)`** — classmethod, three modes. Since checkpoints hold no hyperparameters, every mode requires the caller to supply the same *unbound* component objects they'd hand a fresh `Forecaster(...)` call — resuming looks exactly like constructing a new `Forecaster`, plus `resume=True`.
+**`Forecaster.load_model(checkpoint_path, model, embeddings=None, resume=False, loss=None, validation_score=None, validation_logging_criteria=None, optimizer=None, embedding_regularization=None, model_regularizer=None, training_data=None, validation_data=None, device='cpu', batch_size=512, num_workers=0, pin_memory=True, use_torch_compile=False, learning_rate=None, **forecaster_kwargs)`** — classmethod, three modes. Since checkpoints hold no hyperparameters, every mode requires the caller to supply the same *unbound* component objects they'd hand a fresh `Forecaster(...)` call — resuming looks exactly like constructing a new `Forecaster`, plus `resume=True`.
 
-- `training_datasets=None` → **inference only**. Binds `model`/`embeddings` using the schema and output shape saved in the checkpoint (`ckpt['historic_cols']`/`ckpt['n_outputs']`/etc.), loads weights. No optimizer, loaders, or regularizers — built via `cls.__new__(cls)`, bypassing `__init__`, so calling `.fit()` on the result raises `AttributeError` by design.
-- `resume=True` (requires `training_datasets` and every other component) → **continues the same run**. A full `Forecaster(...)` construction (using the checkpoint's saved schema fields), then weights/optimizer state/regularizer state/log history are loaded on top from the checkpoint. `fc._start_epoch = checkpoint['epoch'] + 1`; raises `ValueError` if `number_of_epochs <= start_epoch`. `learning_rate`, if given, overwrites just the restored optimizer's LR (keeps momentum/Adam moment state).
-- `resume=False` + `training_datasets` given → **warm start**. A fresh `Forecaster(...)` (fresh optimizer, fresh `norm_stats` computed from whatever `training_datasets` are passed now, fresh logs at epoch 0), with only weights loaded as an initialization. `historic_cols`/etc. must be supplied via `forecaster_kwargs` here, same as a plain `Forecaster(...)` call.
+- `training_data=None` → **inference only**. Binds `model`/`embeddings` using the schema and output shape saved in the checkpoint (`ckpt['historic_cols']`/`ckpt['n_outputs']`/etc.), loads weights. No optimizer, loaders, or regularizers — built via `cls.__new__(cls)`, bypassing `__init__`, so calling `.fit()` on the result raises `AttributeError` by design.
+- `resume=True` (requires `training_data` and every other component) → **continues the same run**. A full `Forecaster(...)` construction (using the checkpoint's saved schema fields), then weights/optimizer state/regularizer state/log history are loaded on top from the checkpoint. `fc._start_epoch = checkpoint['epoch'] + 1`; raises `ValueError` if `number_of_epochs <= start_epoch`. `learning_rate`, if given, overwrites just the restored optimizer's LR (keeps momentum/Adam moment state).
+- `resume=False` + `training_data` given → **warm start**. A fresh `Forecaster(...)` (fresh optimizer, fresh `norm_stats` computed from whatever `training_data` is passed now, fresh logs at epoch 0), with only weights loaded as an initialization. `historic_cols`/etc. must be supplied via `forecaster_kwargs` here, same as a plain `Forecaster(...)` call.
 
 `use_torch_compile` is applied *after* weights are loaded (matching `load_weights`'s existing behavior) — compiling is a runtime choice for wherever you're loading, not a fact saved in the checkpoint.
 
-**`predict(x_test, batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=False, epoch=None)`** — `x_test` is a `DataSource` or `list[DataSource]`. Builds a `TimeSeriesDataset` internally using `self.historic_cols`/`self.future_cols`/`self.historic_input_sequence_length`/`self.forecasting_horizon`/`self.norm_stats`, always with `target_col=None`. `device`/`num_workers`/`pin_memory` are independent of whatever training used. `epoch`, if given, calls `self.load_weights(path=self.save_path_epoch.format(epoch=epoch))` before predicting — a **permanent** weight swap into `self.model`/`self.embeddings`, not scoped to the one `predict()` call. No existence check on the checkpoint file — a missing epoch crashes naturally, by design.
+**`predict(x_test, batch_size=None, denormalize=True, device=None, num_workers=0, pin_memory=True, epoch=None)`** — `x_test` is a `TimeSeriesData`. Builds a `TimeSeriesDataset` internally using `self.historic_cols`/`self.future_cols`/`self.historic_input_sequence_length`/`self.forecasting_horizon`/`self.norm_stats`, always with `target_col=None`. `device`/`num_workers`/`pin_memory` are independent of whatever training used. `epoch`, if given, calls `self.load_weights(path=self.save_path_epoch.format(epoch=epoch))` before predicting — a **permanent** weight swap into `self.model`/`self.embeddings`, not scoped to the one `predict()` call. No existence check on the checkpoint file — a missing epoch crashes naturally, by design.
 
 ---
 
