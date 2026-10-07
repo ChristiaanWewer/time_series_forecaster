@@ -52,6 +52,10 @@ How a raw input is represented before it enters the model matters more than it i
 - **Merging different data products.** In environmental modelling the same quantity, such as precipitation, is often available from several data products, each with its own gaps and biases. [Masked mean embeddings](https://hess.copernicus.org/articles/29/6221/2025/) embed each product separately and average the embeddings of the products that are available at each time step, so the model handles missing products naturally instead of discarding those time steps.
 - **Multi-timescale embeddings.** Embeddings that naturally incorporate information at several timescales at once. I have ongoing ideas for this that I will implement later.
 
+### Simpler models
+
+Besides deep learning, I am also interested in simpler models. They often generalize better, are easier to interpret and do not need a heavy compute server to run. For electricity demand, for example, L1 regression is already a strong baseline. Another family of simple models is impulse response functions, such as (combinations of) gamma or exponential functions, which describe how an input affects the target over the following time steps. The [Pastas](https://github.com/pastas/pastas) library is a good example of this: it uses such response functions to show how precipitation and evaporation influence groundwater levels. Because the parameters of these functions have a direct physical meaning, the models are easy to interpret. Implemented in PyTorch, they can be trained efficiently and even combined with other components of the library, such as the piecewise linear embeddings.
+
 ## Quick start
 
 Dependencies are managed with [uv](https://docs.astral.sh/uv/) and the project requires Python 3.14.
