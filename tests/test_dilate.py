@@ -92,7 +92,7 @@ def test_dilate_matches_reference_case_small_gamma():
 
 
 def test_temporal_term_actually_contributes_gradient():
-    # regression guard for the historical bug documented in agents.md: an earlier
+    # regression guard for a historical bug: an earlier
     # pure-PyTorch implementation computed loss_temporal under @torch.no_grad(), so it
     # silently never contributed gradients — DILATE trained on the shape term alone.
     torch.manual_seed(0)

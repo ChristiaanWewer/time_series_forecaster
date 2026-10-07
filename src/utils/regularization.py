@@ -33,7 +33,7 @@ class _Regularizer:
 class RLN(_Regularizer):
     """Regularization Learning Networks (Shavitt & Segal, arXiv:1805.06440) — one
     L1 coefficient learned per weight, jointly with the weights, via the paper's
-    Counterfactual Loss gradient (see agents.md for the full derivation). Summary:
+    Counterfactual Loss gradient. Summary:
 
         g_t = plain data-loss gradient (p.grad right after loss.backward())
         r_t = exp(lambda_t) * sign(w_t)                        — regularization grad

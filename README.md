@@ -56,6 +56,10 @@ How a raw input is represented before it enters the model matters more than it i
 
 Besides deep learning, I am also interested in simpler models. They often generalize better, are easier to interpret and do not need a heavy compute server to run. For electricity demand, for example, L1 regression is already a strong baseline. Another family of simple models is impulse response functions, such as (combinations of) gamma or exponential functions, which describe how an input affects the target over the following time steps. The [Pastas](https://github.com/pastas/pastas) library is a good example of this: it uses such response functions to show how precipitation and evaporation influence groundwater levels. Because the parameters of these functions have a direct physical meaning, the models are easy to interpret. Implemented in PyTorch, they can be trained efficiently and even combined with other components of the library, such as the piecewise linear embeddings.
 
+### Comparing models
+
+When one model scores slightly better than another on a test set, it is not obvious whether the difference is real or just noise. I want to add the [Diebold-Mariano test](https://doi.org/10.1080/07350015.1995.10524599) for this kind of A/B testing between forecasts. It tests whether the difference in forecast error between two models is statistically significant, and it accounts for the autocorrelation in those errors, which is always present in multi-step forecasts.
+
 ## Quick start
 
 Dependencies are managed with [uv](https://docs.astral.sh/uv/) and the project requires Python 3.14.
