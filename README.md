@@ -1,4 +1,4 @@
-# Deep Time Series Forecaster
+# ML Time Series Forecaster
 
 A PyTorch library for deep learning on time series that I am building out of my own interest, so I can implement papers and ideas I find interesting and test them on real data. My specific interests are in **embeddings**, **probabilistic forecasting** and **long range forecasting**, and the library is designed so that each of these can be added as a small, self-contained component instead of a rewrite.
 
