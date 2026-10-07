@@ -34,6 +34,10 @@ Much of my thinking comes from hydrology, where a single model is trained on hun
 
 The next step is multi-timescale learning: one model that predicts at for example hourly and daily resolution, in the spirit of the MTS-LSTM work from the same community.
 
+### Beyond hydrology
+
+Hydrology is where I started, but I do not want the library to be limited to it. I also want to apply it to other domains, such as **demand forecasting** on the [M5 dataset](https://www.kaggle.com/competitions/m5-forecasting-accuracy) and **electricity demand**, and to other datasets that come along. These problems share the same core challenge of learning across many related series of very different magnitude, but each has its own statistical properties, and working with many different types of datasets lets me study how methods behave under each of them. M5, for example, has intermittent sales with many zeros and a hierarchy of products and stores. Electricity demand has strong daily and weekly seasonality and depends heavily on weather and calendar effects. River discharge, in turn, is dominated by rare, sharp peaks. Testing on several domains also keeps the library general instead of tuned to one type of data.
+
 ### Probabilistic forecasting
 
 A single number hides how certain a forecast is, and for decisions such as flood warnings the uncertainty is as important as the forecast itself. Right now the library has quantile regression with **non-crossing quantiles**: the output head predicts the median directly and builds every other quantile as a cumulative positive offset from it, so a 90% quantile can never fall below an 80% quantile, by construction. Expectile regression is implemented in the same way. Forecasts are evaluated with CRPS, a scale-invariant CRPS for comparing series of different magnitude, the Winkler interval score, coverage and interval width.
