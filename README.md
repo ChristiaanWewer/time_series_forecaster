@@ -1,6 +1,6 @@
 # ML Time Series Forecaster
 
-A PyTorch library for deep learning on time series that I am building out of my own interest, so I can implement papers and ideas I find interesting and test them on real data. My specific interests are in **embeddings**, **probabilistic forecasting** and **long range forecasting**, and the library is designed so that each of these can be added as a small, self-contained component instead of a rewrite.
+A PyTorch library for deep learning on time series that I build as a hobby, to implement papers and ideas I find interesting and test them on real data. My main interests are **embeddings**, **probabilistic forecasting**, **regularization** and **long range forecasting**. The library is designed so that I can implement and experiment with new ideas efficiently in my spare time.
 
 > **Use at your own risk.** This is a personal hobby research project and the API still changes dramatically. I am currently implementing a CUDA prefetcher and efficient loading of large time series (a disk-backed data format)..
 
